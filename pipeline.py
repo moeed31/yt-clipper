@@ -3,6 +3,7 @@ import sys
 import subprocess
 import argparse
 import textwrap
+import re
 import yt_dlp
 from faster_whisper import WhisperModel
 from PIL import Image, ImageDraw, ImageEnhance, ImageFont
@@ -14,7 +15,6 @@ TRACKER_FILE = "processed_vods.txt"
 WATERMARK_FILE = "logo.png"
 COOKIES_FILE = "cookies.txt"
 
-# Clients that support cookies vs clients that must run cookie-free
 COOKIE_CLIENTS = {'web', 'mweb', 'web_creator', 'web_embedded'}
 
 def setup_cookies_file():
@@ -55,13 +55,11 @@ def get_ydl_opts(client_name='web'):
             }
         }
     }
-    # Only attach cookies if the client supports cookies (prevents skipping ios/android)
     if HAS_COOKIES and os.path.exists(COOKIES_FILE) and client_name in COOKIE_CLIENTS:
         opts['cookiefile'] = COOKIES_FILE
     return opts
 
 def extract_info_resilient(url, extra_opts=None):
-    """Tries multiple player clients with EJS solver enabled."""
     extra_opts = extra_opts or {}
     clients_order = ['web', 'mweb', 'web_creator', 'ios', 'android']
     last_err = None
@@ -174,17 +172,48 @@ def get_unprocessed_vod_from_channel(channel_url, processed_ids):
                 print(f"Skipping {vid_id} (Already clipped and uploaded).")
     return None, None
 
+def clean_and_extract_teams(title):
+    """Extracts team names like Team A vs Team B from title strings for FPS games."""
+    # Common separators in esports titles
+    patterns = [
+        r"([\w\s]+)\s+(?:vs\.?|versus|-)\s+([\w\s]+)",
+        r"([\w\s]+)\s+vs\s+([\w\s]+)",
+    ]
+    for pat in patterns:
+        match = re.search(pat, title, re.IGNORECASE)
+        if match:
+            t1 = match.group(1).strip().split('|')[-1].strip()
+            t2 = match.group(2).strip().split('|')[0].strip()
+            if len(t1) > 2 and len(t2) > 2:
+                return f"{t1} vs {t2}"
+    return title
+
+def generate_seo_description(game_name, match_title, teams_str, chapters, target_url):
+    """Generates an AI/SEO-optimized description utilizing minimal tokens."""
+    tags_str = " ".join([f"#{t}" for t in TOURNAMENT_CHANNELS.get(game_name.lower().replace(" ", ""), {}).get("tags", ["Esports", "Gaming"])])
+    desc = (
+        f"🔥 Epic pro highlights and best rounds from {teams_str} in this official {game_name} tournament match!\n\n"
+        f"Match: {match_title}\n\n"
+        f"⏱️ Match Chapters:\n{chapters}\n\n"
+        f"📌 Watch the full official stream here: {target_url}\n\n"
+        f"Like and subscribe for daily high-tier esports recaps, pro clutches, and tournament highlights!\n\n"
+        f"{tags_str} #Esports #Gaming #Highlights"
+    )
+    return desc
+
 def get_top_rounds(vod_url, num_rounds=8, clip_duration=45):
     try:
         info = extract_info_resilient(vod_url, {'skip_download': True})
-        title = info.get('title', 'Tournament Match')
+        raw_title = info.get('title', 'Tournament Match')
         heatmap = info.get('heatmap')
         duration = info.get('duration') or 1800
     except Exception as e:
         print(f"Full metadata fallback triggered ({e}), using interval sampling...")
-        title = "Esports Tournament Highlights"
+        raw_title = "Esports Tournament Highlights"
         heatmap = None
         duration = 1800
+
+    teams_title = clean_and_extract_teams(raw_title)
 
     peaks = []
     if heatmap:
@@ -216,11 +245,10 @@ def get_top_rounds(vod_url, num_rounds=8, clip_duration=45):
 
     chrono_rounds = sorted(peaks, key=lambda x: x['start'])
     best_shorts_rounds = sorted(peaks, key=lambda x: x['score'], reverse=True)
-    return title, chrono_rounds, best_shorts_rounds
+    return raw_title, teams_title, chrono_rounds, best_shorts_rounds
 
 def download_round_clips(vod_url, rounds, output_dir="clips"):
     os.makedirs(output_dir, exist_ok=True)
-    # Try cookie-backed web clients first (with Deno EJS solver), then cookie-free mobile clients
     clients_to_try = ["web", "mweb", "web_creator", "ios", "android"]
 
     for idx, r in enumerate(rounds):
@@ -240,7 +268,6 @@ def download_round_clips(vod_url, rounds, output_dir="clips"):
                 "--merge-output-format", "mp4",
                 "-o", out_path,
             ]
-            # Only pass --cookies to clients that support cookies
             if HAS_COOKIES and os.path.exists(COOKIES_FILE) and client in COOKIE_CLIENTS:
                 cmd.extend(["--cookies", COOKIES_FILE])
             cmd.append(vod_url)
@@ -545,10 +572,10 @@ if __name__ == "__main__":
     game_cfg = TOURNAMENT_CHANNELS[selected_game]
     print(f"New Match Found! Processing [{game_cfg['name']}] VOD: {target_url}")
 
-    title, chrono_rounds, best_rounds = get_top_rounds(target_url, num_rounds=8, clip_duration=45)
+    raw_title, teams_title, chrono_rounds, best_rounds = get_top_rounds(target_url, num_rounds=8, clip_duration=45)
     download_round_clips(target_url, chrono_rounds)
     recap_file, chapters = build_16_9_recap(chrono_rounds)
-    thumb_file = generate_custom_thumbnail(best_rounds[0]['file_path'], game_cfg, title)
+    thumb_file = generate_custom_thumbnail(best_rounds[0]['file_path'], game_cfg, raw_title)
 
     short_files = []
     for i in range(min(args.shorts_count, len(best_rounds))):
@@ -557,24 +584,28 @@ if __name__ == "__main__":
             best_rounds[i]['file_path'],
             out_short,
             game_cfg=game_cfg,
-            match_title=title,
+            match_title=raw_title,
             round_rank=i+1
         )
         short_files.append((out_short, best_rounds[i]['score']))
 
     if args.upload:
         yt = get_youtube_client()
-        recap_desc = f"{game_cfg['name']} Top Rounds & Highlights from {title}\n\nChapters:\n{chapters}\n\nSource: {target_url}"
+        
+        # Build optimized title and description with extracted teams
+        recap_title = f"{teams_title} - Best Rounds & Highlights ({game_cfg['name']})"
+        recap_desc = generate_seo_description(game_cfg['name'], raw_title, teams_title, chapters, target_url)
+
         upload_to_youtube(
             yt, recap_file,
-            f"{title} - All Best Rounds ({game_cfg['name']})",
+            recap_title,
             recap_desc, game_cfg["tags"],
             thumbnail_path=thumb_file
         )
 
         for idx, (s_file, score) in enumerate(short_files):
-            s_title = f"{game_cfg['name']} Insane Tournament Clutch #{idx+1} 🔥 #Shorts"
-            s_desc = f"Most replayed tournament moment from {title} (Hype Score: {score}) #Shorts #{' #'.join(game_cfg['tags'])}"
+            s_title = f"{teams_title} Insane Clutch #{idx+1} 🔥 {game_cfg['name']} #Shorts"
+            s_desc = f"Most replayed moment from {teams_title} ({game_cfg['name']}) #Shorts #{' #'.join(game_cfg['tags'])}"
             upload_to_youtube(yt, s_file, s_title, s_desc, game_cfg["tags"] + ["Shorts"])
 
-    mark_vod_as_processed(target_id, selected_game, title)
+    mark_vod_as_processed(target_id, selected_game, raw_title)
