@@ -45,6 +45,11 @@ jobs:
       - name: Ensure processed_vods.txt exists
         run: touch processed_vods.txt
 
+      - name: Install Deno (Required by yt-dlp for YouTube JS Challenge)
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
       - name: Start YouTube BotGuard PO-Token Server
         run: |
           docker run --name bgutil-provider -d --init -p 127.0.0.1:4416:4416 brainicism/bgutil-ytdlp-pot-provider
@@ -60,9 +65,9 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Python Dependencies & PO-Token Plugin
+      - name: Install Python Dependencies & EJS Solver
         run: |
-          pip install -U "yt-dlp[default,curl-cffi]" bgutil-ytdlp-pot-provider Pillow faster-whisper google-api-python-client google-auth-oauthlib google-auth-httplib2
+          pip install -U "yt-dlp[default,curl-cffi]" yt-dlp-ejs bgutil-ytdlp-pot-provider Pillow faster-whisper google-api-python-client google-auth-oauthlib google-auth-httplib2
 
       - name: Run 9-Game Clipping Pipeline
         env:
