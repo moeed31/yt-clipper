@@ -14,9 +14,9 @@ TRACKER_FILE = "processed_vods.txt"
 WATERMARK_FILE = "logo.png"
 COOKIES_FILE = "cookies.txt"
 
-# ==========================================================
-# AUTO-REPAIR & WRITE NETSCAPE COOKIES FROM GITHUB SECRETS
-# ==========================================================
+# Clients that support cookies vs clients that must run cookie-free
+COOKIE_CLIENTS = {'web', 'mweb', 'web_creator', 'web_embedded'}
+
 def setup_cookies_file():
     raw_cookies = os.environ.get("YT_COOKIES", "").strip()
     if not raw_cookies:
@@ -25,12 +25,8 @@ def setup_cookies_file():
     repaired_lines = ["# Netscape HTTP Cookie File"]
     for line in raw_cookies.splitlines():
         s = line.strip()
-        if not s or s.startswith("#"):
-            if s.startswith("#HttpOnly_"):
-                pass  # Keep HttpOnly prefix lines
-            else:
-                continue
-        # Convert accidental mobile copy-paste spaces back into strict 7-column tabs
+        if not s or (s.startswith("#") and not s.startswith("#HttpOnly_")):
+            continue
         parts = s.split("\t") if "\t" in s else s.split()
         if len(parts) >= 7:
             repaired_lines.append("\t".join(parts[:6] + [" ".join(parts[6:])]))
@@ -44,42 +40,38 @@ def setup_cookies_file():
 
 HAS_COOKIES = setup_cookies_file()
 
-def get_ydl_opts(client_list=None):
-    if client_list is None:
-        client_list = ['web', 'mweb', 'tv'] if HAS_COOKIES else ['tv', 'web_embedded', 'ios']
+def get_ydl_opts(client_name='web'):
     opts = {
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
+        'remote_components': ['ejs:github'],
         'extractor_args': {
             'youtube': {
-                'player_client': client_list,
+                'player_client': [client_name],
             },
             'youtubepot-bgutilhttp': {
                 'base_url': ['http://127.0.0.1:4416']
             }
         }
     }
-    if HAS_COOKIES and os.path.exists(COOKIES_FILE):
+    # Only attach cookies if the client supports cookies (prevents skipping ios/android)
+    if HAS_COOKIES and os.path.exists(COOKIES_FILE) and client_name in COOKIE_CLIENTS:
         opts['cookiefile'] = COOKIES_FILE
     return opts
 
 def extract_info_resilient(url, extra_opts=None):
-    """Tries multiple player clients sequentially so a block on one client never crashes the pipeline."""
+    """Tries multiple player clients with EJS solver enabled."""
     extra_opts = extra_opts or {}
-    client_profiles = (
-        [['web'], ['mweb'], ['tv'], ['web_embedded'], ['ios']]
-        if HAS_COOKIES else
-        [['tv'], ['web_embedded'], ['ios'], ['mweb'], ['web']]
-    )
+    clients_order = ['web', 'mweb', 'web_creator', 'ios', 'android']
     last_err = None
-    for profile in client_profiles:
-        opts = {**get_ydl_opts(profile), **extra_opts}
+    for client_name in clients_order:
+        opts = {**get_ydl_opts(client_name), **extra_opts}
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
         except Exception as e:
-            print(f"Client {profile} challenged, trying next fallback...")
+            print(f"Metadata client [{client_name}] fallback ({e})...")
             last_err = e
     raise last_err
 
@@ -152,9 +144,6 @@ def get_whisper_model():
         WHISPER_MODEL = WhisperModel("base.en", device="cpu", compute_type="int8")
     return WHISPER_MODEL
 
-# ==========================================================
-# DUPLICATE TRACKER FUNCTIONS
-# ==========================================================
 def load_processed_vods():
     if not os.path.exists(TRACKER_FILE):
         return set()
@@ -173,7 +162,7 @@ def extract_video_id(vod_url):
 def get_unprocessed_vod_from_channel(channel_url, processed_ids):
     info = extract_info_resilient(channel_url, {
         'extract_flat': True,
-        'playlistend': 8,
+        'playlistend': 10,
     })
     for entry in info.get('entries', []):
         vid_id = entry.get('id')
@@ -185,15 +174,12 @@ def get_unprocessed_vod_from_channel(channel_url, processed_ids):
                 print(f"Skipping {vid_id} (Already clipped and uploaded).")
     return None, None
 
-# ==========================================================
-# HEATMAP & CLIPPING FUNCTIONS
-# ==========================================================
 def get_top_rounds(vod_url, num_rounds=8, clip_duration=45):
     try:
         info = extract_info_resilient(vod_url, {'skip_download': True})
         title = info.get('title', 'Tournament Match')
         heatmap = info.get('heatmap')
-        duration = info.get('duration', 1800)
+        duration = info.get('duration') or 1800
     except Exception as e:
         print(f"Full metadata fallback triggered ({e}), using interval sampling...")
         title = "Esports Tournament Highlights"
@@ -218,7 +204,7 @@ def get_top_rounds(vod_url, num_rounds=8, clip_duration=45):
                 break
     else:
         print("No heatmap data yet on this VOD. Sampling high-action mid-game intervals...")
-        step = max(120, duration // (num_rounds + 1))
+        step = max(120, int(duration) // (num_rounds + 1))
         for i in range(1, num_rounds + 1):
             start = i * step
             peaks.append({
@@ -234,7 +220,8 @@ def get_top_rounds(vod_url, num_rounds=8, clip_duration=45):
 
 def download_round_clips(vod_url, rounds, output_dir="clips"):
     os.makedirs(output_dir, exist_ok=True)
-    clients_to_try = ["web", "mweb", "tv", "web_embedded", "ios"]
+    # Try cookie-backed web clients first (with Deno EJS solver), then cookie-free mobile clients
+    clients_to_try = ["web", "mweb", "web_creator", "ios", "android"]
 
     for idx, r in enumerate(rounds):
         out_path = os.path.join(output_dir, f"round_{idx+1:02d}.mp4")
@@ -245,15 +232,16 @@ def download_round_clips(vod_url, rounds, output_dir="clips"):
         for client in clients_to_try:
             cmd = [
                 "yt-dlp",
-                "--impersonate", "chrome",
+                "--remote-components", "ejs:github",
                 "--extractor-args", f"youtube:player_client={client};youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
-                "--format", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                "--format", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
                 "--download-sections", section_arg,
                 "--force-keyframes-at-cuts",
                 "--merge-output-format", "mp4",
                 "-o", out_path,
             ]
-            if HAS_COOKIES and os.path.exists(COOKIES_FILE):
+            # Only pass --cookies to clients that support cookies
+            if HAS_COOKIES and os.path.exists(COOKIES_FILE) and client in COOKIE_CLIENTS:
                 cmd.extend(["--cookies", COOKIES_FILE])
             cmd.append(vod_url)
 
@@ -264,7 +252,7 @@ def download_round_clips(vod_url, rounds, output_dir="clips"):
             print(f"Download client [{client}] failed, retrying with next client...")
 
         if not downloaded:
-            raise RuntimeError(f"All player clients failed for {vod_url}. Verify YT_COOKIES secret.")
+            raise RuntimeError(f"All player clients failed for {vod_url}.")
         r['file_path'] = out_path
 
 def build_16_9_recap(rounds, output_file="match_recap_16_9.mp4"):
@@ -296,9 +284,6 @@ def build_16_9_recap(rounds, output_file="match_recap_16_9.mp4"):
 
     return output_file, "\n".join(chapters)
 
-# ==========================================================
-# FONT LOADER & SHORTS BANNER + SUBTITLES GENERATOR
-# ==========================================================
 def load_bold_font(size):
     font_paths = [
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
@@ -426,9 +411,6 @@ def build_9_16_short(input_clip, output_short, game_cfg, match_title, round_rank
     ], check=True)
     return output_short
 
-# ==========================================================
-# AUTO-THUMBNAIL GENERATOR (16:9 RECAP)
-# ==========================================================
 def generate_custom_thumbnail(best_clip_path, game_cfg, match_title, output_thumb="thumbnail.jpg"):
     raw_frame = "raw_frame.jpg"
     subprocess.run([
@@ -483,9 +465,6 @@ def generate_custom_thumbnail(best_clip_path, game_cfg, match_title, output_thum
     img.convert("RGB").save(output_thumb, "JPEG", quality=92)
     return output_thumb
 
-# ==========================================================
-# YOUTUBE UPLOAD & THUMBNAIL ATTACHMENT
-# ==========================================================
 def get_youtube_client():
     creds = Credentials(
         token=None,
