@@ -13,6 +13,17 @@ from googleapiclient.http import MediaFileUpload
 TRACKER_FILE = "processed_vods.txt"
 WATERMARK_FILE = "logo.png"
 
+# Common yt-dlp options to bypass YouTube's datacenter bot check on GitHub Actions
+YDL_BASE_OPTS = {
+    'quiet': True,
+    'no_warnings': True,
+    'extractor_args': {
+        'youtube': {
+            'player_client': ['android', 'ios', 'mweb', 'web']
+        }
+    }
+}
+
 # ==========================================================
 # 9-GAME OFFICIAL TOURNAMENT CHANNEL DIRECTORY
 # ==========================================================
@@ -82,6 +93,9 @@ def get_whisper_model():
         WHISPER_MODEL = WhisperModel("base.en", device="cpu", compute_type="int8")
     return WHISPER_MODEL
 
+# ==========================================================
+# DUPLICATE TRACKER FUNCTIONS
+# ==========================================================
 def load_processed_vods():
     if not os.path.exists(TRACKER_FILE):
         return set()
@@ -94,17 +108,16 @@ def mark_vod_as_processed(vod_id, game_key, title):
     print(f"Saved VOD ID [{vod_id}] ({game_key}: {title}) to {TRACKER_FILE}")
 
 def extract_video_id(vod_url):
-    ydl_opts = {'skip_download': True, 'quiet': True, 'no_warnings': True}
+    ydl_opts = {**YDL_BASE_OPTS, 'skip_download': True}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(vod_url, download=False)
         return info.get('id')
 
 def get_unprocessed_vod_from_channel(channel_url, processed_ids):
     ydl_opts = {
+        **YDL_BASE_OPTS,
         'extract_flat': True,
         'playlistend': 8,
-        'quiet': True,
-        'no_warnings': True,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(channel_url, download=False)
@@ -118,8 +131,11 @@ def get_unprocessed_vod_from_channel(channel_url, processed_ids):
                     print(f"Skipping {vid_id} (Already clipped and uploaded).")
     return None, None
 
+# ==========================================================
+# HEATMAP & CLIPPING FUNCTIONS
+# ==========================================================
 def get_top_rounds(vod_url, num_rounds=8, clip_duration=45):
-    ydl_opts = {'skip_download': True, 'quiet': True, 'no_warnings': True}
+    ydl_opts = {**YDL_BASE_OPTS, 'skip_download': True}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(vod_url, download=False)
 
@@ -143,6 +159,7 @@ def get_top_rounds(vod_url, num_rounds=8, clip_duration=45):
             if len(peaks) >= num_rounds:
                 break
     else:
+        print("No heatmap data yet. Sampling high-action mid-game intervals...")
         duration = info.get('duration', 1800)
         step = max(120, duration // (num_rounds + 1))
         for i in range(1, num_rounds + 1):
@@ -163,9 +180,11 @@ def download_round_clips(vod_url, rounds, output_dir="clips"):
     for idx, r in enumerate(rounds):
         out_path = os.path.join(output_dir, f"round_{idx+1:02d}.mp4")
         section_arg = f"*{r['start']}-{r['end']}"
+        print(f"Downloading Round {idx+1}: {r['start']}s to {r['end']}s (Hype Score: {r['score']})")
         cmd = [
             "yt-dlp",
-            "--format", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
+            "--extractor-args", "youtube:player_client=android,ios,mweb,web",
+            "--format", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "--download-sections", section_arg,
             "--force-keyframes-at-cuts",
             "--merge-output-format", "mp4",
@@ -176,9 +195,6 @@ def download_round_clips(vod_url, rounds, output_dir="clips"):
         r['file_path'] = out_path
 
 def build_16_9_recap(rounds, output_file="match_recap_16_9.mp4"):
-    """
-    Stitches rounds together and overlays the logo watermark in the top-right corner.
-    """
     concat_list = "concat_list.txt"
     chapters = []
     current_time = 0
@@ -195,12 +211,10 @@ def build_16_9_recap(rounds, output_file="match_recap_16_9.mp4"):
         "-i", concat_list, "-c", "copy", temp_merged
     ], check=True)
 
-    # If logo.png exists, scale it to width 140px and overlay at top-right (W-w-35:35)
     if os.path.exists(WATERMARK_FILE):
-        filter_complex = "[0:v][1:v]overlay=W-w-35:35[outv]"
         subprocess.run([
             "ffmpeg", "-y", "-i", temp_merged, "-i", WATERMARK_FILE,
-            "-filter_complex", f"[1:v]scale=140:-1[logo];[0:v][logo]overlay=W-w-35:35",
+            "-filter_complex", "[1:v]scale=140:-1[logo];[0:v][logo]overlay=W-w-35:35",
             "-c:v", "libx264", "-preset", "fast", "-crf", "20",
             "-c:a", "copy", output_file
         ], check=True)
@@ -209,6 +223,9 @@ def build_16_9_recap(rounds, output_file="match_recap_16_9.mp4"):
 
     return output_file, "\n".join(chapters)
 
+# ==========================================================
+# FONT LOADER & SHORTS BANNER + SUBTITLES GENERATOR
+# ==========================================================
 def load_bold_font(size):
     font_paths = [
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
@@ -306,7 +323,6 @@ def build_9_16_short(input_clip, output_short, game_cfg, match_title, round_rank
         )
         sub_filter = f",subtitles={srt_file}:force_style='{style}'"
 
-    # Inputs: [0:v] video, [1:v] banner.png, [2:v] logo.png (optional)
     if os.path.exists(WATERMARK_FILE):
         filter_complex = (
             "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,"
@@ -337,6 +353,9 @@ def build_9_16_short(input_clip, output_short, game_cfg, match_title, round_rank
     ], check=True)
     return output_short
 
+# ==========================================================
+# AUTO-THUMBNAIL GENERATOR (16:9 RECAP)
+# ==========================================================
 def generate_custom_thumbnail(best_clip_path, game_cfg, match_title, output_thumb="thumbnail.jpg"):
     raw_frame = "raw_frame.jpg"
     subprocess.run([
@@ -348,7 +367,6 @@ def generate_custom_thumbnail(best_clip_path, game_cfg, match_title, output_thum
     img = ImageEnhance.Color(img).enhance(1.30)
     img = ImageEnhance.Contrast(img).enhance(1.15)
 
-    # Paste logo watermark onto top-right of 16:9 thumbnail if present
     if os.path.exists(WATERMARK_FILE):
         logo_thumb = Image.open(WATERMARK_FILE).convert("RGBA")
         logo_thumb.thumbnail((160, 160))
@@ -392,6 +410,9 @@ def generate_custom_thumbnail(best_clip_path, game_cfg, match_title, output_thum
     img.convert("RGB").save(output_thumb, "JPEG", quality=92)
     return output_thumb
 
+# ==========================================================
+# YOUTUBE UPLOAD & THUMBNAIL ATTACHMENT
+# ==========================================================
 def get_youtube_client():
     creds = Credentials(
         token=None,
