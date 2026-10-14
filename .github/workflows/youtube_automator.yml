@@ -1,4 +1,4 @@
-name: 9-Game Tournament Clipper & Shorts Automator
+name: 9-Game Tournament Clipper & Multi-Platform Automator
 
 permissions:
   contents: write
@@ -27,7 +27,7 @@ on:
         required: false
         default: ''
       shorts_count:
-        description: 'Number of Shorts to clip & post'
+        description: 'Number of Shorts/Reels/TikToks to clip & post'
         required: false
         default: '2'
 
@@ -65,16 +65,21 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Python Dependencies & EJS Solver
+      - name: Install Python Dependencies & Multi-Platform SDKs
         run: |
-          pip install -U "yt-dlp[default,curl-cffi]" yt-dlp-ejs bgutil-ytdlp-pot-provider Pillow faster-whisper google-api-python-client google-auth-oauthlib google-auth-httplib2
+          pip install -U "yt-dlp[default,curl-cffi]" yt-dlp-ejs bgutil-ytdlp-pot-provider Pillow faster-whisper google-api-python-client google-auth-oauthlib google-auth-httplib2 requests google-genai
 
-      - name: Run 9-Game Clipping Pipeline
+      - name: Run 9-Game Multi-Platform Pipeline
         env:
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           YT_COOKIES: ${{ secrets.YT_COOKIES }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          TIKTOK_ACCESS_TOKEN: ${{ secrets.TIKTOK_ACCESS_TOKEN }}
         run: |
           GAME="${{ github.event.inputs.game || 'auto' }}"
           VOD_URL="${{ github.event.inputs.vod_url || '' }}"
