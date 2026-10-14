@@ -12,17 +12,29 @@ from googleapiclient.http import MediaFileUpload
 
 TRACKER_FILE = "processed_vods.txt"
 WATERMARK_FILE = "logo.png"
+COOKIES_FILE = "cookies.txt"
 
-# Common yt-dlp options to bypass YouTube's datacenter bot check on GitHub Actions
-YDL_BASE_OPTS = {
-    'quiet': True,
-    'no_warnings': True,
-    'extractor_args': {
-        'youtube': {
-            'player_client': ['android', 'ios', 'mweb', 'web']
+# If user optionally added YT_COOKIES in GitHub Secrets, write it to cookies.txt
+if os.environ.get("YT_COOKIES", "").strip():
+    with open(COOKIES_FILE, "w", encoding="utf-8") as f:
+        f.write(os.environ["YT_COOKIES"].strip() + "\n")
+
+def get_ydl_base_opts():
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['mweb', 'tv_embedded', 'web', 'ios']
+            },
+            'youtubepot-bgutilhttp': {
+                'base_url': ['http://127.0.0.1:4416']
+            }
         }
     }
-}
+    if os.path.exists(COOKIES_FILE):
+        opts['cookiefile'] = COOKIES_FILE
+    return opts
 
 # ==========================================================
 # 9-GAME OFFICIAL TOURNAMENT CHANNEL DIRECTORY
@@ -93,9 +105,6 @@ def get_whisper_model():
         WHISPER_MODEL = WhisperModel("base.en", device="cpu", compute_type="int8")
     return WHISPER_MODEL
 
-# ==========================================================
-# DUPLICATE TRACKER FUNCTIONS
-# ==========================================================
 def load_processed_vods():
     if not os.path.exists(TRACKER_FILE):
         return set()
@@ -108,14 +117,14 @@ def mark_vod_as_processed(vod_id, game_key, title):
     print(f"Saved VOD ID [{vod_id}] ({game_key}: {title}) to {TRACKER_FILE}")
 
 def extract_video_id(vod_url):
-    ydl_opts = {**YDL_BASE_OPTS, 'skip_download': True}
+    ydl_opts = {**get_ydl_base_opts(), 'skip_download': True}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(vod_url, download=False)
         return info.get('id')
 
 def get_unprocessed_vod_from_channel(channel_url, processed_ids):
     ydl_opts = {
-        **YDL_BASE_OPTS,
+        **get_ydl_base_opts(),
         'extract_flat': True,
         'playlistend': 8,
     }
@@ -131,11 +140,8 @@ def get_unprocessed_vod_from_channel(channel_url, processed_ids):
                     print(f"Skipping {vid_id} (Already clipped and uploaded).")
     return None, None
 
-# ==========================================================
-# HEATMAP & CLIPPING FUNCTIONS
-# ==========================================================
 def get_top_rounds(vod_url, num_rounds=8, clip_duration=45):
-    ydl_opts = {**YDL_BASE_OPTS, 'skip_download': True}
+    ydl_opts = {**get_ydl_base_opts(), 'skip_download': True}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(vod_url, download=False)
 
@@ -183,14 +189,16 @@ def download_round_clips(vod_url, rounds, output_dir="clips"):
         print(f"Downloading Round {idx+1}: {r['start']}s to {r['end']}s (Hype Score: {r['score']})")
         cmd = [
             "yt-dlp",
-            "--extractor-args", "youtube:player_client=android,ios,mweb,web",
+            "--extractor-args", "youtube:player_client=mweb,tv_embedded,web,ios;youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
             "--format", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "--download-sections", section_arg,
             "--force-keyframes-at-cuts",
             "--merge-output-format", "mp4",
             "-o", out_path,
-            vod_url
         ]
+        if os.path.exists(COOKIES_FILE):
+            cmd.extend(["--cookies", COOKIES_FILE])
+        cmd.append(vod_url)
         subprocess.run(cmd, check=True)
         r['file_path'] = out_path
 
@@ -223,9 +231,6 @@ def build_16_9_recap(rounds, output_file="match_recap_16_9.mp4"):
 
     return output_file, "\n".join(chapters)
 
-# ==========================================================
-# FONT LOADER & SHORTS BANNER + SUBTITLES GENERATOR
-# ==========================================================
 def load_bold_font(size):
     font_paths = [
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
@@ -353,9 +358,6 @@ def build_9_16_short(input_clip, output_short, game_cfg, match_title, round_rank
     ], check=True)
     return output_short
 
-# ==========================================================
-# AUTO-THUMBNAIL GENERATOR (16:9 RECAP)
-# ==========================================================
 def generate_custom_thumbnail(best_clip_path, game_cfg, match_title, output_thumb="thumbnail.jpg"):
     raw_frame = "raw_frame.jpg"
     subprocess.run([
@@ -410,9 +412,6 @@ def generate_custom_thumbnail(best_clip_path, game_cfg, match_title, output_thum
     img.convert("RGB").save(output_thumb, "JPEG", quality=92)
     return output_thumb
 
-# ==========================================================
-# YOUTUBE UPLOAD & THUMBNAIL ATTACHMENT
-# ==========================================================
 def get_youtube_client():
     creds = Credentials(
         token=None,
