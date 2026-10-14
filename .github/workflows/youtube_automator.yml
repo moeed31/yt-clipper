@@ -45,7 +45,7 @@ jobs:
       - name: Ensure processed_vods.txt exists
         run: touch processed_vods.txt
 
-      - name: Start YouTube BotGuard PO-Token Server (Bypasses Bot Check)
+      - name: Start YouTube BotGuard PO-Token Server
         run: |
           docker run --name bgutil-provider -d --init -p 127.0.0.1:4416:4416 brainicism/bgutil-ytdlp-pot-provider
           sleep 3
@@ -62,7 +62,7 @@ jobs:
 
       - name: Install Python Dependencies & PO-Token Plugin
         run: |
-          pip install -U "yt-dlp[default]" bgutil-ytdlp-pot-provider Pillow faster-whisper google-api-python-client google-auth-oauthlib google-auth-httplib2
+          pip install -U "yt-dlp[default,curl-cffi]" bgutil-ytdlp-pot-provider Pillow faster-whisper google-api-python-client google-auth-oauthlib google-auth-httplib2
 
       - name: Run 9-Game Clipping Pipeline
         env:
