@@ -126,6 +126,8 @@ PROCESSED_FILE = Path("processed_vods.txt")
 PLAYLIST_CACHE_FILE = Path("playlists.json")
 WORK_DIR = Path("work_dir").resolve()
 WORK_DIR.mkdir(parents=True, exist_ok=True)
+IG_STAGE_DIR = Path("ig_stage").resolve()
+IG_STAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ==============================================================================
@@ -225,13 +227,13 @@ def find_and_download_vod(game_key: str) -> tuple[Path, dict]:
 
 
 # ==============================================================================
-# 4. SMART HIGHLIGHT ENGINE (BATTLE ROYALE FINAL CIRCLE vs. EXTENDED TACTICAL)
+# 4. SMART HIGHLIGHT ENGINE (EXTENDED POST-ROUND & FULL FINAL CIRCLE)
 # ==============================================================================
 def get_smart_highlight_segments(video_path: Path, game_key: str) -> tuple[list[tuple[float, float]], list[float]]:
     """
-    Returns:
-      - segments: Chronological list of (start, end) tuples for the 16:9 Long-Form Recap.
-      - top_peaks: Top hype timestamps (in seconds) for 9:16 Vertical Shorts/Reels/TikToks.
+    Ensures rounds and fights NEVER cut off early:
+    - Tactical games: 18s pre-peak + 42s post-peak (60s per full round) across 20 rounds.
+    - Battle Royale: 25s pre-peak + 70s post-peak (95s per full squad fight) + 5.5-min Final Circle.
     """
     game_info = GAME_CONFIG[game_key]
     game_type = game_info["type"]
@@ -261,7 +263,7 @@ def get_smart_highlight_segments(video_path: Path, game_key: str) -> tuple[list[
     smoothed_energy = np.convolve(rms_per_sec, np.ones(5) / 5.0, mode="same")
 
     start_bound = min(90, int(num_seconds * 0.05))
-    end_bound = max(num_seconds - 45, int(num_seconds * 0.96))
+    end_bound = max(num_seconds - 40, int(num_seconds * 0.96))
 
     # Find top 5 absolute hype peaks across the match for 9:16 Vertical Shorts
     shorts_energy = smoothed_energy.copy()
@@ -273,46 +275,46 @@ def get_smart_highlight_segments(video_path: Path, game_key: str) -> tuple[list[
         if shorts_energy[p] <= 0:
             break
         top_peaks.append(float(p))
-        shorts_energy[max(0, p - 60):min(num_seconds, p + 60)] = 0
+        shorts_energy[max(0, p - 75):min(num_seconds, p + 75)] = 0
 
     segments = []
 
     if game_type == "battle_royale":
-        print(f"[*] Battle Royale Mode ({game_info['name']}): Extracting Best Full Fights + Unbroken Final Circle...")
-        midgame_cutoff = int(start_bound + (end_bound - start_bound) * 0.72)
+        print(f"[*] Battle Royale Mode ({game_info['name']}): Full 95s Fights + Complete 5.5-Min Final Circle...")
+        midgame_cutoff = int(start_bound + (end_bound - start_bound) * 0.70)
 
-        # 1. Lock onto the Final Circle Climax in the last 28% of the VOD
+        # 1. Lock onto the Final Circle Climax in the last 30% of the VOD
         endgame_slice = smoothed_energy[midgame_cutoff:end_bound]
-        climax_sec = (midgame_cutoff + int(np.argmax(endgame_slice))) if len(endgame_slice) > 0 else (end_bound - 30)
+        climax_sec = (midgame_cutoff + int(np.argmax(endgame_slice))) if len(endgame_slice) > 0 else (end_bound - 45)
 
-        # Capture continuous 4.5-minute Final Circle showdown (240s before winning moment + 30s winner reaction)
-        final_circle_start = max(start_bound, climax_sec - 240)
-        final_circle_end = min(total_duration, climax_sec + 30)
+        # Capture continuous 5.5-minute Final Circle showdown (270s lead-up + 60s winner celebration)
+        final_circle_start = max(start_bound, climax_sec - 270)
+        final_circle_end = min(total_duration, climax_sec + 60)
 
-        # 2. Extract Top 8 Complete Mid-Game Squad Fights (75s each: 30s engage + 45s wipe/reset)
+        # 2. Extract Top 7 Complete Mid-Game Squad Fights (95s each: 25s engage + 70s full squad wipe & reset)
         energy_copy = smoothed_energy.copy()
         energy_copy[:start_bound] = 0
-        energy_copy[max(0, final_circle_start - 15):] = 0
+        energy_copy[max(0, final_circle_start - 20):] = 0
 
-        for _ in range(8):
+        for _ in range(7):
             peak_sec = int(np.argmax(energy_copy))
             if energy_copy[peak_sec] <= 0:
                 break
-            f_start = max(start_bound, peak_sec - 30)
-            f_end = min(final_circle_start - 5, peak_sec + 45)
-            if f_end - f_start >= 35:
+            f_start = max(start_bound, peak_sec - 25)
+            f_end = min(final_circle_start - 5, peak_sec + 70)
+            if f_end - f_start >= 45:
                 segments.append((float(f_start), float(f_end)))
-            energy_copy[max(0, peak_sec - 55):min(num_seconds, peak_sec + 55)] = 0
+            energy_copy[max(0, peak_sec - 75):min(num_seconds, peak_sec + 75)] = 0
 
         # Append the unbroken Final Circle climax at the end
         segments.append((float(final_circle_start), float(final_circle_end)))
 
     else:
-        print(f"[*] Tactical Mode ({game_info['name']}): Extracting 24 Extended Rounds (~15-18 min video)...")
-        # Extract 24 full action rounds (42 seconds each = ~16.8 minutes total)
-        num_rounds = 24
-        pre_pad = 24   # Full round execute / site take setup
-        post_pad = 18  # Clutch finish + caster hype + round banner
+        print(f"[*] Tactical Mode ({game_info['name']}): Extracting 20 Full Rounds (60s per round w/ 42s post-peak tail)...")
+        # Entry spike happens mid-round -> 18s before spike + 42s after spike ensures round end is ALWAYS shown
+        num_rounds = 20
+        pre_pad = 18   # Build-up & site execute
+        post_pad = 42  # Full post-plant, clutch finish, round-win banner & caster reaction
 
         energy_copy = smoothed_energy.copy()
         energy_copy[:start_bound] = 0
@@ -325,9 +327,10 @@ def get_smart_highlight_segments(video_path: Path, game_key: str) -> tuple[list[
             r_start = max(start_bound, peak_sec - pre_pad)
             r_end = min(total_duration, peak_sec + post_pad)
             segments.append((float(r_start), float(r_end)))
-            energy_copy[max(0, peak_sec - 30):min(num_seconds, peak_sec + 30)] = 0
+            # Mask out surrounding window so we pick distinct rounds across the whole match
+            energy_copy[max(0, peak_sec - 45):min(num_seconds, peak_sec + 50)] = 0
 
-    # Sort chronologically and merge overlapping or adjacent clips within 4 seconds
+    # Sort chronologically and merge overlapping or adjacent clips within 8 seconds
     segments.sort(key=lambda x: x[0])
     merged = []
     for seg in segments:
@@ -335,7 +338,7 @@ def get_smart_highlight_segments(video_path: Path, game_key: str) -> tuple[list[
             merged.append(list(seg))
         else:
             prev = merged[-1]
-            if seg[0] <= prev[1] + 4.0:
+            if seg[0] <= prev[1] + 8.0:
                 prev[1] = max(prev[1], seg[1])
             else:
                 merged.append(list(seg))
@@ -361,7 +364,7 @@ def render_16x9_recap(source_vod: Path, segments: list[tuple[float, float]], out
             "-ss", str(start_t),
             "-t", str(dur),
             "-i", str(source_vod.resolve()),
-            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+            "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
             str(part_path)
@@ -427,9 +430,12 @@ def format_ass_time(seconds: float) -> str:
 
 
 def render_9x16_short(source_vod: Path, peak_sec: float, game_key: str, banner_title: str, whisper_model: WhisperModel, out_mp4: Path):
-    # 58 seconds fits YouTube Shorts, IG Reels, FB Reels, and TikTok cleanly
+    """
+    Renders a 58s vertical Short starting 15s before the action spike and continuing
+    for 43s AFTER the spike so the round-winning kill/clutch never cuts off early.
+    """
     clip_dur = 58.0
-    start_sec = max(10.0, peak_sec - 28.0)
+    start_sec = max(10.0, peak_sec - 15.0)
     raw_clip = (WORK_DIR / "short_raw.mp4").resolve()
     wav_clip = (WORK_DIR / "short_audio.wav").resolve()
     ass_file = (WORK_DIR / "subtitles.ass").resolve()
@@ -485,21 +491,22 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     ass_file.write_text(ass_header + "\n".join(events) + "\n", encoding="utf-8")
 
-    # Render blurred 9:16 background + sharp centered gameplay (scale=1080:-2 ensures even height) + burned-in ASS subtitles
+    # Strict Instagram/YouTube Reel encoding: yuv420p, 30fps, +faststart
     vf_complex = (
         "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5[bg];"
         "[0:v]scale=1080:-2:force_original_aspect_ratio=decrease[fg];"
-        "[bg][fg]overlay=(W-w)/2:(H-h)/2,ass=subtitles.ass[vout]"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2,ass=subtitles.ass,format=yuv420p[vout]"
     )
     subprocess.run([
         "ffmpeg", "-y", "-i", str(raw_clip),
         "-filter_complex", vf_complex,
         "-map", "[vout]", "-map", "0:a?",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
-        "-c:a", "aac", "-b:a", "160k",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+        "-r", "30", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2",
         str(out_mp4_abs)
     ], cwd=str(WORK_DIR.resolve()), check=True)
-    print(f"[+] Rendered 9:16 Subtitled Short: {out_mp4_abs}")
+    print(f"[+] Rendered 9:16 Subtitled Short (58s w/ 43s post-peak tail): {out_mp4_abs}")
 
 
 # ==============================================================================
@@ -548,7 +555,7 @@ def generate_seo_metadata(vod_title: str, game_key: str) -> dict:
 
 
 # ==============================================================================
-# 7. MULTI-PLATFORM PUBLISHERS (YOUTUBE + PLAYLISTS, FB, IG REELS, TIKTOK)
+# 7. MULTI-PLATFORM PUBLISHERS (YOUTUBE + PLAYLISTS, FB PAGE, FB REELS, IG REELS)
 # ==============================================================================
 def get_youtube_client():
     cid = os.environ.get("YT_CLIENT_ID", "").strip()
@@ -709,7 +716,50 @@ def upload_to_facebook_reels(video_path: Path, caption: str):
         print(f"[-] FB Reel Error: {e}")
 
 
-def upload_to_instagram_reels(video_path: Path, caption: str):
+def stage_video_for_instagram(video_path: Path, idx: int) -> str | None:
+    """
+    Stages the MP4 directly via GitHub's own raw CDN (raw.githubusercontent.com)
+    with fallback to 0x0.st / catbox so Meta's servers NEVER get blocked.
+    """
+    repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    branch = os.environ.get("GITHUB_REF_NAME", "main").strip()
+
+    if repo:
+        try:
+            stage_filename = f"reel_{int(time.time())}_{idx}.mp4"
+            staged_path = IG_STAGE_DIR / stage_filename
+            shutil.copy2(video_path.resolve(), staged_path)
+
+            subprocess.run(["git", "add", "-f", str(staged_path)], check=True)
+            subprocess.run(["git", "commit", "-m", f"temp: stage reel {idx} for IG [skip ci]"], check=True)
+            subprocess.run(["git", "push", "origin", f"HEAD:{branch}"], check=True)
+
+            raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/ig_stage/{stage_filename}"
+            time.sleep(5)  # Give GitHub CDN 5 seconds to propagate
+            print(f"[+] Staged MP4 on GitHub Raw CDN: {raw_url}")
+            return raw_url
+        except Exception as e:
+            print(f"[!] GitHub Raw staging fallback triggered: {e}")
+
+    # Fallback 1: Catbox permanent raw upload
+    try:
+        with open(video_path.resolve(), "rb") as f:
+            res = requests.post(
+                "https://catbox.moe/user/api.php",
+                data={"reqtype": "fileupload"},
+                files={"fileToUpload": f},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=180
+            )
+        if res.status_code == 200 and res.text.strip().startswith("http"):
+            return res.text.strip()
+    except Exception:
+        pass
+
+    return None
+
+
+def upload_to_instagram_reels(video_path: Path, caption: str, idx: int):
     ig_user_id = os.environ.get("IG_USER_ID", "").strip()
     token = os.environ.get("FB_PAGE_ACCESS_TOKEN", "").strip()
     if not (ig_user_id and token):
@@ -717,20 +767,10 @@ def upload_to_instagram_reels(video_path: Path, caption: str):
         return
 
     try:
-        print("[*] Staging Short on Litterbox (Catbox) for Instagram Graph API...")
-        with open(video_path.resolve(), "rb") as f:
-            host_res = requests.post(
-                "https://litterbox.catbox.moe/resources/internals/api.php",
-                data={"reqtype": "fileupload", "time": "1h"},
-                files={"fileToUpload": f},
-                timeout=180
-            )
-        if host_res.status_code != 200 or not host_res.text.startswith("http"):
-            print(f"[-] IG Staging Failed: {host_res.text}")
+        public_video_url = stage_video_for_instagram(video_path, idx)
+        if not public_video_url:
+            print("[-] IG Staging Failed: Could not obtain public MP4 URL.")
             return
-
-        public_video_url = host_res.text.strip()
-        print(f"[+] Staged direct MP4 URL for IG: {public_video_url}")
 
         container_url = f"https://graph.facebook.com/v21.0/{ig_user_id}/media"
         c_res = requests.post(container_url, data={
@@ -742,18 +782,18 @@ def upload_to_instagram_reels(video_path: Path, caption: str):
         }).json()
 
         if "id" not in c_res:
-            print(f"[-] IG Container Error: {c_res}")
+            print(f"[-] IG Container Creation Error: {c_res}")
             return
 
         creation_id = c_res["id"]
         print(f"[*] Polling IG Container {creation_id} status...")
 
         status_url = f"https://graph.facebook.com/v21.0/{creation_id}"
-        for attempt in range(18):
+        for attempt in range(24):
             time.sleep(10)
             s_res = requests.get(status_url, params={"fields": "status_code,status", "access_token": token}).json()
             code = s_res.get("status_code", "")
-            print(f"    [IG Poll {attempt+1}/18] status_code = {code}")
+            print(f"    [IG Poll {attempt+1}/24] status_code = {code} | details = {s_res.get('status', '')}")
             if code == "FINISHED":
                 break
             if code in ("ERROR", "EXPIRED"):
@@ -772,101 +812,6 @@ def upload_to_instagram_reels(video_path: Path, caption: str):
         print(f"[-] Instagram Upload Exception: {e}")
 
 
-def get_active_tiktok_token() -> str:
-    fallback_token = os.environ.get("TIKTOK_ACCESS_TOKEN", "").strip()
-    refresh_token = os.environ.get("TIKTOK_REFRESH_TOKEN", "").strip()
-    client_key = os.environ.get("TIKTOK_CLIENT_KEY", "sbawdctpohczr9bgiv").strip()
-    client_secret = os.environ.get("TIKTOK_CLIENT_SECRET", "2e5DenQpSuXqO4w1pHtnFwnqyv8A0V17").strip()
-
-    if refresh_token:
-        try:
-            res = requests.post(
-                "https://open.tiktokapis.com/v2/oauth/token/",
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                data={
-                    "client_key": client_key,
-                    "client_secret": client_secret,
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token
-                },
-                timeout=30
-            ).json()
-            if "access_token" in res:
-                print("[+] Automatically refreshed TikTok Access Token!")
-                return res["access_token"]
-        except Exception as e:
-            print(f"[!] TikTok refresh error: {e}")
-    return fallback_token
-
-
-def upload_to_tiktok(video_path: Path, title: str, access_token: str):
-    if not access_token:
-        print("[!] Skipping TikTok: Missing TIKTOK_ACCESS_TOKEN")
-        return
-
-    try:
-        file_size = video_path.stat().st_size
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json; charset=UTF-8"
-        }
-
-        # 1. Try Direct Post with SELF_ONLY (Required for TikTok Sandbox apps)
-        init_url = "https://open.tiktokapis.com/v2/post/publish/video/init/"
-        direct_payload = {
-            "post_info": {
-                "title": title[:150],
-                "privacy_level": "SELF_ONLY",
-                "disable_duet": False,
-                "disable_comment": False,
-                "disable_stitch": False
-            },
-            "source_info": {
-                "source": "FILE_UPLOAD",
-                "video_size": file_size,
-                "chunk_size": file_size,
-                "total_chunk_count": 1
-            }
-        }
-        res = requests.post(init_url, headers=headers, json=direct_payload, timeout=30).json()
-
-        # 2. Fallback to Inbox Draft Upload (/v2/post/publish/inbox/video/init/) if Direct Post is restricted
-        if res.get("error", {}).get("code") != "ok":
-            print(f"[*] TikTok Direct Post response ({res.get('error', {}).get('code')}), switching to Inbox Upload...")
-            inbox_url = "https://open.tiktokapis.com/v2/post/publish/inbox/video/init/"
-            inbox_payload = {
-                "source_info": {
-                    "source": "FILE_UPLOAD",
-                    "video_size": file_size,
-                    "chunk_size": file_size,
-                    "total_chunk_count": 1
-                }
-            }
-            res = requests.post(inbox_url, headers=headers, json=inbox_payload, timeout=30).json()
-
-        if res.get("error", {}).get("code") != "ok":
-            print(f"[-] TikTok Init Failed: {res}")
-            return
-
-        upload_url = res["data"]["upload_url"]
-        publish_id = res["data"]["publish_id"]
-
-        put_headers = {
-            "Content-Type": "video/mp4",
-            "Content-Length": str(file_size),
-            "Content-Range": f"bytes 0-{file_size - 1}/{file_size}"
-        }
-        with open(video_path.resolve(), "rb") as f:
-            put_res = requests.put(upload_url, headers=put_headers, data=f, timeout=180)
-
-        if put_res.status_code in (200, 201, 206):
-            print(f"[+] SUCCESS! TikTok Video Uploaded (Publish ID: {publish_id})")
-        else:
-            print(f"[-] TikTok PUT Failed ({put_res.status_code}): {put_res.text}")
-    except Exception as e:
-        print(f"[-] TikTok Upload Exception: {e}")
-
-
 # ==============================================================================
 # 8. MAIN EXECUTION PIPELINE
 # ==============================================================================
@@ -880,7 +825,7 @@ def main():
     vod_title = info.get("title", f"{GAME_CONFIG[game_key]['name']} Pro Tournament Match")
     print(f"[+] Downloaded VOD: {vod_title} ({vod_id})")
 
-    # 2. Extract Smart Highlights (Battle Royale Final Circle + Best Fights OR 24 Tactical Rounds)
+    # 2. Extract Smart Highlights (Full 60s Tactical Rounds or 95s BR Fights + 5.5m Final Circle)
     segments, top_peaks = get_smart_highlight_segments(vod_path, game_key)
 
     # 3. Generate Minimal-Token Gemini SEO Metadata
@@ -906,10 +851,9 @@ def main():
     if yt_recap_id:
         post_youtube_link_to_facebook_page(yt_recap_id, seo["yt_title"])
 
-    # 6. Render & Distribute 9:16 Vertical Shorts (YouTube Shorts, FB Reels, IG Reels, TikTok)
+    # 6. Render & Distribute 9:16 Vertical Shorts (YouTube Shorts, FB Reels, IG Reels)
     print("[*] Loading faster-whisper model for word-by-word Short subtitles...")
     whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
-    tiktok_token = get_active_tiktok_token()
 
     for idx, peak in enumerate(top_peaks[:shorts_count]):
         short_mp4 = (WORK_DIR / f"short_{idx+1}.mp4").resolve()
@@ -929,15 +873,14 @@ def main():
         )
         # B. Facebook Reel
         upload_to_facebook_reels(short_mp4, short_caption)
-        # C. Instagram Reel (Staged via Litterbox + Polled until FINISHED)
-        upload_to_instagram_reels(short_mp4, short_caption)
-        # D. TikTok (Sandbox-compliant SELF_ONLY + Inbox fallback)
-        upload_to_tiktok(short_mp4, short_caption, tiktok_token)
+        # C. Instagram Reel (Staged via GitHub Raw CDN + Polled until FINISHED)
+        upload_to_instagram_reels(short_mp4, short_caption, idx + 1)
 
-    # 7. Record VOD ID so it is never duplicated
+    # 7. Record VOD ID & Clean Up
     mark_vod_processed(vod_id)
     shutil.rmtree(WORK_DIR, ignore_errors=True)
-    print("[+] ALL PLATFORMS COMPLETED SUCCESSFULLY!")
+    shutil.rmtree(IG_STAGE_DIR, ignore_errors=True)
+    print("[+] ALL PLATFORMS (YOUTUBE, FACEBOOK, INSTAGRAM) COMPLETED SUCCESSFULLY!")
 
 
 if __name__ == "__main__":
