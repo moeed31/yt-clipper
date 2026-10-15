@@ -1,100 +1,123 @@
 name: 9-Game Tournament Clipper & Multi-Platform Automator
 
-permissions:
-  contents: write
-
 on:
+  schedule:
+    - cron: '0 */6 * * *' # Runs automatically every 6 hours
   workflow_dispatch:
     inputs:
       game:
-        description: 'Select Esport Channel (or auto to scan all 9)'
+        description: 'Select Game (or auto to rotate all 9 games)'
         required: true
         default: 'auto'
         type: choice
         options:
           - auto
           - valorant
-          - cs2
-          - pubgm
-          - pubgpc
           - apex
+          - cs2
+          - pubg
+          - fortnite
           - r6
           - cod
           - tekken
-          - fortnite
+          - lol
       vod_url:
-        description: 'Optional: Paste specific VOD URL (leave blank to auto-fetch)'
+        description: 'Optional: Specific YouTube VOD URL (leave blank for auto-search)'
         required: false
         default: ''
       shorts_count:
-        description: 'Number of Shorts/Reels/TikToks to clip & post'
-        required: false
+        description: 'Number of Shorts/Reels/TikToks to generate (1-3)'
+        required: true
         default: '2'
 
-  # Runs automatically at 12:00 PM UTC (5:00 PM PKT) every day
-  schedule:
-    - cron: '0 12 * * *'
+permissions:
+  contents: write
 
 jobs:
-  clip-and-upload:
+  clip_and_publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-
-      - name: Ensure Tracker & Playlist Cache Files Exist
-        run: |
-          touch processed_vods.txt
-          if [ ! -f playlists.json ]; then echo "{}" > playlists.json; fi
-
-      - name: Install Deno (Required by yt-dlp for YouTube JS Challenge)
-        uses: denoland/setup-deno@v2
-        with:
-          deno-version: v2.x
-
-      - name: Start YouTube BotGuard PO-Token Server
-        run: |
-          docker run --name bgutil-provider -d --init -p 127.0.0.1:4416:4416 brainicism/bgutil-ytdlp-pot-provider
-          sleep 3
-
-      - name: Install FFmpeg & Bold Fonts
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-liberation fonts-dejavu-core
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install Python Dependencies & Multi-Platform SDKs
+      - name: Install System Dependencies (FFmpeg, Fonts, ImageMagick, Deno, Docker)
         run: |
-          pip install -U "yt-dlp[default,curl-cffi]" yt-dlp-ejs bgutil-ytdlp-pot-provider Pillow faster-whisper google-api-python-client google-auth-oauthlib google-auth-httplib2 requests google-genai
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-liberation fonts-dejavu-core imagemagick curl unzip
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
 
-      - name: Run 9-Game Multi-Platform Pipeline
+      - name: Start YouTube PO-Token Provider Server (Bypass Bot Check)
+        run: |
+          docker run -d --name bgutil-pot -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider:latest
+          sleep 5
+
+      - name: Install Python Packages
+        run: |
+          pip install --upgrade pip
+          pip install "yt-dlp[default,curl-cffi]" yt-dlp-ejs bgutil-ytdlp-pot-provider
+          pip install faster-whisper numpy pillow requests google-genai
+          pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
+
+      - name: Prepare Netscape YouTube Cookies (Auto-Repair Formatting)
         env:
+          RAW_COOKIES: ${{ secrets.YT_COOKIES }}
+        run: |
+          python3 -c '
+          import os
+          raw = os.environ.get("RAW_COOKIES", "").strip()
+          if raw:
+              lines = ["#" + " Netscape HTTP Cookie File"]
+              for line in raw.splitlines():
+                  s = line.strip()
+                  if not s or s.startswith("#"):
+                      continue
+                  parts = s.split("\t") if "\t" in s else s.split()
+                  if len(parts) >= 7:
+                      domain = parts[0]
+                      flag = "TRUE" if domain.startswith(".") else "FALSE"
+                      path = parts[2]
+                      secure = parts[3].upper() if parts[3].upper() in ("TRUE", "FALSE") else "TRUE"
+                      expiry = parts[4] if parts[4].isdigit() else "1893456000"
+                      name = parts[5]
+                      val = parts[6]
+                      lines.append(f"{domain}\t{flag}\t{path}\t{secure}\t{expiry}\t{name}\t{val}")
+              with open("cookies.txt", "w", encoding="utf-8") as f:
+                  f.write("\n".join(lines) + "\n")
+              print(f"[+] Wrote {len(lines)-1} repaired cookies to cookies.txt")
+          '
+
+      - name: Run Multi-Platform Esports Pipeline
+        env:
+          TARGET_GAME: ${{ github.event.inputs.game || 'auto' }}
+          CUSTOM_VOD_URL: ${{ github.event.inputs.vod_url || '' }}
+          SHORTS_COUNT: ${{ github.event.inputs.shorts_count || '2' }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
-          YT_COOKIES: ${{ secrets.YT_COOKIES }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
-          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
           TIKTOK_ACCESS_TOKEN: ${{ secrets.TIKTOK_ACCESS_TOKEN }}
+          TIKTOK_REFRESH_TOKEN: ${{ secrets.TIKTOK_REFRESH_TOKEN }}
+          TIKTOK_CLIENT_KEY: ${{ secrets.TIKTOK_CLIENT_KEY || 'sbawdctpohczr9bgiv' }}
+          TIKTOK_CLIENT_SECRET: ${{ secrets.TIKTOK_CLIENT_SECRET || '2e5DenQpSuXqO4w1pHtnFwnqyv8A0V17' }}
         run: |
-          GAME="${{ github.event.inputs.game || 'auto' }}"
-          VOD_URL="${{ github.event.inputs.vod_url || '' }}"
-          SHORTS="${{ github.event.inputs.shorts_count || '2' }}"
-          if [ -n "$VOD_URL" ]; then
-            python pipeline.py --game "$GAME" --url "$VOD_URL" --shorts-count "$SHORTS" --upload
-          else
-            python pipeline.py --game "$GAME" --shorts-count "$SHORTS" --upload
-          fi
+          python3 pipeline.py
 
-      - name: Save Processed VOD ID & Playlist Cache to Repository
+      - name: Commit Updated State (processed_vods.txt & playlists.json)
+        if: always()
         run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add processed_vods.txt playlists.json
+          git config --local user.email "actions@github.com"
+          git config --local user.name "Esports Automator Bot"
+          git add processed_vods.txt playlists.json 2>/dev/null || true
           git diff --staged --quiet || (git commit -m "chore: update processed VODs and playlist cache [skip ci]" && git push)
