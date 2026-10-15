@@ -42,8 +42,10 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Ensure processed_vods.txt exists
-        run: touch processed_vods.txt
+      - name: Ensure Tracker & Playlist Cache Files Exist
+        run: |
+          touch processed_vods.txt
+          if [ ! -f playlists.json ]; then echo "{}" > playlists.json; fi
 
       - name: Install Deno (Required by yt-dlp for YouTube JS Challenge)
         uses: denoland/setup-deno@v2
@@ -90,9 +92,9 @@ jobs:
             python pipeline.py --game "$GAME" --shorts-count "$SHORTS" --upload
           fi
 
-      - name: Save Processed VOD ID to Repository
+      - name: Save Processed VOD ID & Playlist Cache to Repository
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          git add processed_vods.txt
-          git diff --staged --quiet || (git commit -m "chore: mark tournament VOD as processed [skip ci]" && git push)
+          git add processed_vods.txt playlists.json
+          git diff --staged --quiet || (git commit -m "chore: update processed VODs and playlist cache [skip ci]" && git push)
