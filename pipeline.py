@@ -9,7 +9,7 @@ import subprocess
 import requests
 import numpy as np
 from pathlib import Path
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
+from PIL import Image, ImageDraw, ImageFont, ImageEnhance
 
 from google import genai
 from google.oauth2.credentials import Credentials
@@ -124,8 +124,8 @@ GAME_CONFIG = {
 
 PROCESSED_FILE = Path("processed_vods.txt")
 PLAYLIST_CACHE_FILE = Path("playlists.json")
-WORK_DIR = Path("work_dir")
-WORK_DIR.mkdir(exist_ok=True)
+WORK_DIR = Path("work_dir").resolve()
+WORK_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ==============================================================================
@@ -149,7 +149,6 @@ def select_target_game() -> str:
     target = os.environ.get("TARGET_GAME", "auto").strip().lower()
     if target in GAME_CONFIG:
         return target
-    # Rotate smoothly based on number of processed VODs so every game gets turns
     processed_count = len(load_processed_vods())
     keys = list(GAME_CONFIG.keys())
     selected = keys[processed_count % len(keys)]
@@ -167,8 +166,9 @@ def get_ytdlp_base_args() -> list[str]:
         "--no-playlist",
         "--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
     ]
-    if Path("cookies.txt").exists() and Path("cookies.txt").stat().st_size > 40:
-        args.extend(["--cookies", "cookies.txt"])
+    cookie_file = Path("cookies.txt").resolve()
+    if cookie_file.exists() and cookie_file.stat().st_size > 40:
+        args.extend(["--cookies", str(cookie_file)])
     return args
 
 
@@ -176,7 +176,7 @@ def find_and_download_vod(game_key: str) -> tuple[Path, dict]:
     custom_url = os.environ.get("CUSTOM_VOD_URL", "").strip()
     processed_ids = load_processed_vods()
     game_info = GAME_CONFIG[game_key]
-    output_template = str(WORK_DIR / "source_vod.%(ext)s")
+    output_template = str((WORK_DIR / "source_vod.%(ext)s").resolve())
 
     candidates = []
     if custom_url:
@@ -195,7 +195,6 @@ def find_and_download_vod(game_key: str) -> tuple[Path, dict]:
                 data = json.loads(line)
                 vid_id = data.get("id")
                 duration = data.get("duration") or 0
-                # Filter for full single-map/match VODs (18 mins to 95 mins)
                 if vid_id and vid_id not in processed_ids and 1080 <= duration <= 5700:
                     candidates.append(f"https://www.youtube.com/watch?v={vid_id}")
             except Exception:
@@ -204,7 +203,6 @@ def find_and_download_vod(game_key: str) -> tuple[Path, dict]:
     if not candidates:
         raise RuntimeError(f"No suitable unprocessed VODs found for {game_info['name']}.")
 
-    # Try downloading top candidates with fallback clients
     for url in candidates[:4]:
         print(f"[*] Attempting download: {url}")
         dl_cmd = get_ytdlp_base_args() + [
@@ -215,8 +213,8 @@ def find_and_download_vod(game_key: str) -> tuple[Path, dict]:
             url
         ]
         proc = subprocess.run(dl_cmd)
-        mp4_path = WORK_DIR / "source_vod.mp4"
-        info_path = WORK_DIR / "source_vod.info.json"
+        mp4_path = (WORK_DIR / "source_vod.mp4").resolve()
+        info_path = (WORK_DIR / "source_vod.info.json").resolve()
         if proc.returncode == 0 and mp4_path.exists():
             info_data = {}
             if info_path.exists():
@@ -240,13 +238,13 @@ def get_smart_highlight_segments(video_path: Path, game_key: str) -> tuple[list[
 
     probe_cmd = [
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)
+        "-of", "default=noprint_wrappers=1:nokey=1", str(video_path.resolve())
     ]
     total_duration = float(subprocess.check_output(probe_cmd).decode().strip())
 
     # Extract 1-second RMS audio energy profile using ffmpeg at 8000Hz mono
     pcm_cmd = [
-        "ffmpeg", "-i", str(video_path), "-vn", "-ac", "1", "-ar", "8000",
+        "ffmpeg", "-i", str(video_path.resolve()), "-vn", "-ac", "1", "-ar", "8000",
         "-f", "s16le", "-"
     ]
     proc = subprocess.Popen(pcm_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -352,17 +350,17 @@ def get_smart_highlight_segments(video_path: Path, game_key: str) -> tuple[list[
 # 5. VIDEO RENDERING: 16:9 RECAP, CUSTOM THUMBNAIL & 9:16 SUBTITLED SHORTS
 # ==============================================================================
 def render_16x9_recap(source_vod: Path, segments: list[tuple[float, float]], output_path: Path):
-    concat_list_file = WORK_DIR / "concat_list.txt"
+    concat_list_file = (WORK_DIR / "concat_list.txt").resolve()
     part_files = []
 
     for idx, (start_t, end_t) in enumerate(segments):
         dur = round(end_t - start_t, 2)
-        part_path = WORK_DIR / f"seg_{idx:03d}.mp4"
+        part_path = (WORK_DIR / f"seg_{idx:03d}.mp4").resolve()
         cmd = [
             "ffmpeg", "-y",
             "-ss", str(start_t),
             "-t", str(dur),
-            "-i", str(source_vod),
+            "-i", str(source_vod.resolve()),
             "-vf", "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
             "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
@@ -377,7 +375,7 @@ def render_16x9_recap(source_vod: Path, segments: list[tuple[float, float]], out
 
     subprocess.run([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-        "-i", str(concat_list_file), "-c", "copy", str(output_path)
+        "-i", str(concat_list_file), "-c", "copy", str(output_path.resolve())
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
     for p in part_files:
@@ -386,9 +384,9 @@ def render_16x9_recap(source_vod: Path, segments: list[tuple[float, float]], out
 
 
 def generate_custom_thumbnail(source_vod: Path, peak_sec: float, game_key: str, headline: str, out_jpg: Path):
-    raw_frame = WORK_DIR / "thumb_raw.jpg"
+    raw_frame = (WORK_DIR / "thumb_raw.jpg").resolve()
     subprocess.run([
-        "ffmpeg", "-y", "-ss", str(peak_sec), "-i", str(source_vod),
+        "ffmpeg", "-y", "-ss", str(peak_sec), "-i", str(source_vod.resolve()),
         "-frames:v", "1", "-q:v", "2", str(raw_frame)
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -400,7 +398,6 @@ def generate_custom_thumbnail(source_vod: Path, peak_sec: float, game_key: str, 
     draw = ImageDraw.Draw(overlay)
 
     accent = GAME_CONFIG[game_key]["accent_color"]
-    # Bottom dark gradient bar + vibrant gaming border
     draw.rectangle([0, 480, 1280, 720], fill=(10, 10, 16, 215))
     draw.rectangle([0, 0, 1280, 720], outline=accent + (255,), width=14)
     draw.rectangle([40, 455, 440, 505], fill=accent + (255,))
@@ -418,7 +415,7 @@ def generate_custom_thumbnail(source_vod: Path, peak_sec: float, game_key: str, 
     draw.text((45, 615), GAME_CONFIG[game_key]["name"].upper(), font=font_main, fill=accent + (255,))
 
     combined = Image.alpha_composite(img, overlay).convert("RGB")
-    combined.save(out_jpg, "JPEG", quality=92)
+    combined.save(out_jpg.resolve(), "JPEG", quality=92)
     print(f"[+] Generated Custom Thumbnail: {out_jpg}")
 
 
@@ -433,13 +430,14 @@ def render_9x16_short(source_vod: Path, peak_sec: float, game_key: str, banner_t
     # 58 seconds fits YouTube Shorts, IG Reels, FB Reels, and TikTok cleanly
     clip_dur = 58.0
     start_sec = max(10.0, peak_sec - 28.0)
-    raw_clip = WORK_DIR / "short_raw.mp4"
-    wav_clip = WORK_DIR / "short_audio.wav"
-    ass_file = WORK_DIR / "subtitles.ass"
+    raw_clip = (WORK_DIR / "short_raw.mp4").resolve()
+    wav_clip = (WORK_DIR / "short_audio.wav").resolve()
+    ass_file = (WORK_DIR / "subtitles.ass").resolve()
+    out_mp4_abs = out_mp4.resolve()
 
     subprocess.run([
         "ffmpeg", "-y", "-ss", str(start_sec), "-t", str(clip_dur),
-        "-i", str(source_vod), "-c:v", "libx264", "-preset", "ultrafast",
+        "-i", str(source_vod.resolve()), "-c:v", "libx264", "-preset", "ultrafast",
         "-c:a", "aac", str(raw_clip)
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
@@ -476,32 +474,32 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             if len(chunk) == 3:
                 s_t = format_ass_time(max(0.0, chunk[0].start))
                 e_t = format_ass_time(min(clip_dur, chunk[-1].end))
-                txt = " ".join(x.word.strip().upper() for x in chunk)
+                txt = re.sub(r"[{}\\]", "", " ".join(x.word.strip().upper() for x in chunk))
                 events.append(f"Dialogue: 1,{s_t},{e_t},WordSub,,0,0,0,,{txt}")
                 chunk = []
         if chunk:
             s_t = format_ass_time(max(0.0, chunk[0].start))
             e_t = format_ass_time(min(clip_dur, chunk[-1].end))
-            txt = " ".join(x.word.strip().upper() for x in chunk)
+            txt = re.sub(r"[{}\\]", "", " ".join(x.word.strip().upper() for x in chunk))
             events.append(f"Dialogue: 1,{s_t},{e_t},WordSub,,0,0,0,,{txt}")
 
     ass_file.write_text(ass_header + "\n".join(events) + "\n", encoding="utf-8")
 
-    # Render blurred 9:16 background + sharp centered gameplay + burned-in ASS subtitles
+    # Render blurred 9:16 background + sharp centered gameplay (scale=1080:-2 ensures even height) + burned-in ASS subtitles
     vf_complex = (
         "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5[bg];"
-        "[0:v]scale=1080:-1:force_original_aspect_ratio=decrease[fg];"
-        f"[bg][fg]overlay=(W-w)/2:(H-h)/2,ass={ass_file.name}[vout]"
+        "[0:v]scale=1080:-2:force_original_aspect_ratio=decrease[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2,ass=subtitles.ass[vout]"
     )
     subprocess.run([
         "ffmpeg", "-y", "-i", str(raw_clip),
         "-filter_complex", vf_complex,
-        "-map", "[vout]", "-map", "0:a",
+        "-map", "[vout]", "-map", "0:a?",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
         "-c:a", "aac", "-b:a", "160k",
-        str(out_mp4)
-    ], cwd=str(WORK_DIR), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-    print(f"[+] Rendered 9:16 Subtitled Short: {out_mp4}")
+        str(out_mp4_abs)
+    ], cwd=str(WORK_DIR.resolve()), check=True)
+    print(f"[+] Rendered 9:16 Subtitled Short: {out_mp4_abs}")
 
 
 # ==============================================================================
@@ -617,7 +615,7 @@ def upload_youtube_video(youtube, video_path: Path, title: str, description: str
                 "selfDeclaredMadeForKids": False
             }
         }
-        media = MediaFileUpload(str(video_path), chunksize=10 * 1024 * 1024, resumable=True)
+        media = MediaFileUpload(str(video_path.resolve()), chunksize=10 * 1024 * 1024, resumable=True)
         req = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
         response = None
         while response is None:
@@ -627,7 +625,7 @@ def upload_youtube_video(youtube, video_path: Path, title: str, description: str
 
         if thumb_path and thumb_path.exists():
             try:
-                youtube.thumbnails().set(videoId=vid_id, media_body=MediaFileUpload(str(thumb_path))).execute()
+                youtube.thumbnails().set(videoId=vid_id, media_body=MediaFileUpload(str(thumb_path.resolve()))).execute()
                 print("[+] Custom YouTube thumbnail applied!")
             except Exception as te:
                 print(f"[!] Thumbnail upload warning: {te}")
@@ -675,7 +673,6 @@ def upload_to_facebook_reels(video_path: Path, caption: str):
         return
 
     try:
-        # Step 1: Initialize Reel Upload
         init_url = f"https://graph.facebook.com/v21.0/{page_id}/video_reels"
         init_res = requests.post(init_url, data={"upload_phase": "start", "access_token": token}).json()
         if "video_id" not in init_res:
@@ -684,10 +681,9 @@ def upload_to_facebook_reels(video_path: Path, caption: str):
         video_id = init_res["video_id"]
         upload_url = init_res["upload_url"]
 
-        # Step 2: Upload binary file
         file_size = video_path.stat().st_size
-        with open(video_path, "rb") as f:
-            up_res = requests.post(
+        with open(video_path.resolve(), "rb") as f:
+            requests.post(
                 upload_url,
                 headers={
                     "Authorization": f"OAuth {token}",
@@ -696,9 +692,8 @@ def upload_to_facebook_reels(video_path: Path, caption: str):
                 },
                 data=f,
                 timeout=180
-            ).json()
+            )
 
-        # Step 3: Publish Reel
         pub_res = requests.post(
             init_url,
             data={
@@ -723,7 +718,7 @@ def upload_to_instagram_reels(video_path: Path, caption: str):
 
     try:
         print("[*] Staging Short on Litterbox (Catbox) for Instagram Graph API...")
-        with open(video_path, "rb") as f:
+        with open(video_path.resolve(), "rb") as f:
             host_res = requests.post(
                 "https://litterbox.catbox.moe/resources/internals/api.php",
                 data={"reqtype": "fileupload", "time": "1h"},
@@ -737,7 +732,6 @@ def upload_to_instagram_reels(video_path: Path, caption: str):
         public_video_url = host_res.text.strip()
         print(f"[+] Staged direct MP4 URL for IG: {public_video_url}")
 
-        # Create IG Reel container
         container_url = f"https://graph.facebook.com/v21.0/{ig_user_id}/media"
         c_res = requests.post(container_url, data={
             "media_type": "REELS",
@@ -862,7 +856,7 @@ def upload_to_tiktok(video_path: Path, title: str, access_token: str):
             "Content-Length": str(file_size),
             "Content-Range": f"bytes 0-{file_size - 1}/{file_size}"
         }
-        with open(video_path, "rb") as f:
+        with open(video_path.resolve(), "rb") as f:
             put_res = requests.put(upload_url, headers=put_headers, data=f, timeout=180)
 
         if put_res.status_code in (200, 201, 206):
@@ -893,8 +887,8 @@ def main():
     seo = generate_seo_metadata(vod_title, game_key)
 
     # 4. Render 16:9 Full Recap & Custom Thumbnail
-    recap_mp4 = WORK_DIR / "final_recap_16x9.mp4"
-    thumb_jpg = WORK_DIR / "custom_thumb.jpg"
+    recap_mp4 = (WORK_DIR / "final_recap_16x9.mp4").resolve()
+    thumb_jpg = (WORK_DIR / "custom_thumb.jpg").resolve()
     render_16x9_recap(vod_path, segments, recap_mp4)
     generate_custom_thumbnail(vod_path, top_peaks[0], game_key, seo["match_headline"], thumb_jpg)
 
@@ -918,7 +912,7 @@ def main():
     tiktok_token = get_active_tiktok_token()
 
     for idx, peak in enumerate(top_peaks[:shorts_count]):
-        short_mp4 = WORK_DIR / f"short_{idx+1}.mp4"
+        short_mp4 = (WORK_DIR / f"short_{idx+1}.mp4").resolve()
         render_9x16_short(vod_path, peak, game_key, seo["match_headline"], whisper_model, short_mp4)
 
         short_title = f"{seo['match_headline']} - Insane {GAME_CONFIG[game_key]['name']} Highlight #{idx+1} #Shorts"
