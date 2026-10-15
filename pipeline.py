@@ -1,9 +1,12 @@
 import os
 import sys
+import time
+import json
 import subprocess
 import argparse
 import textwrap
 import re
+import requests
 import yt_dlp
 from faster_whisper import WhisperModel
 from PIL import Image, ImageDraw, ImageEnhance, ImageFont
@@ -12,6 +15,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
 TRACKER_FILE = "processed_vods.txt"
+PLAYLIST_CACHE_FILE = "playlists.json"
 WATERMARK_FILE = "logo.png"
 COOKIES_FILE = "cookies.txt"
 
@@ -79,54 +83,63 @@ def extract_info_resilient(url, extra_opts=None):
 TOURNAMENT_CHANNELS = {
     "valorant": {
         "name": "VALORANT VCT",
+        "playlist_title": "VALORANT VCT Tournament Highlights & Clutches",
         "url": "https://www.youtube.com/@ValorantEsports/streams",
         "tags": ["Valorant", "VCT", "ValorantClips", "Esports"],
         "accent": (255, 70, 85)
     },
     "cs2": {
         "name": "CS2 PREMIER",
+        "playlist_title": "CS2 Premier Tournament Highlights & Clutches",
         "url": "https://www.youtube.com/@BLASTPremier/streams",
         "tags": ["CS2", "CounterStrike2", "BLASTPremier", "ESLCS"],
         "accent": (255, 165, 0)
     },
     "pubgm": {
         "name": "PUBG MOBILE",
+        "playlist_title": "PUBG Mobile Esports Highlights & Clutches",
         "url": "https://www.youtube.com/@PUBGMOBILEEsports/streams",
         "tags": ["PUBGMobile", "PMGC", "PUBGMEsports", "MobileGaming"],
         "accent": (255, 204, 0)
     },
     "pubgpc": {
         "name": "PUBG ESPORTS",
+        "playlist_title": "PUBG PC Tournament Highlights & Clutches",
         "url": "https://www.youtube.com/@PUBGEsports/streams",
         "tags": ["PUBG", "PUBGEsports", "PGC", "Battlegrounds"],
         "accent": (242, 169, 0)
     },
     "apex": {
         "name": "APEX ALGS",
+        "playlist_title": "Apex Legends ALGS Highlights & Clutches",
         "url": "https://www.youtube.com/@playapexesports/streams",
         "tags": ["ApexLegends", "ALGS", "ApexClips", "Esports"],
         "accent": (218, 41, 42)
     },
     "r6": {
         "name": "RAINBOW SIX",
+        "playlist_title": "Rainbow Six Siege Esports Highlights & Clutches",
         "url": "https://www.youtube.com/@RainbowSixEsports/streams",
         "tags": ["RainbowSixSiege", "R6Esports", "SixInvitational", "R6S"],
         "accent": (0, 174, 239)
     },
     "cod": {
         "name": "COD LEAGUE",
+        "playlist_title": "Call of Duty League CDL Highlights & Clutches",
         "url": "https://www.youtube.com/@CODLeague/streams",
         "tags": ["CallOfDuty", "CDL", "CODLeague", "Warzone"],
         "accent": (255, 102, 0)
     },
     "tekken": {
         "name": "TEKKEN 8 TWT",
+        "playlist_title": "Tekken 8 World Tour Highlights & Combos",
         "url": "https://www.youtube.com/@BNFC_official/videos",
         "tags": ["Tekken8", "TWT", "TekkenWorldTour", "FGC"],
         "accent": (255, 0, 102)
     },
     "fortnite": {
         "name": "FORTNITE FNCS",
+        "playlist_title": "Fortnite FNCS Tournament Highlights & Clutches",
         "url": "https://www.youtube.com/@fncompetitive/streams",
         "tags": ["Fortnite", "FNCS", "FortniteCompetitive", "FortniteClips"],
         "accent": (0, 210, 255)
@@ -172,35 +185,73 @@ def get_unprocessed_vod_from_channel(channel_url, processed_ids):
                 print(f"Skipping {vid_id} (Already clipped and uploaded).")
     return None, None
 
-def clean_and_extract_teams(title):
-    """Extracts team names like Team A vs Team B from title strings for FPS games."""
-    # Common separators in esports titles
+# ==========================================================
+# ULTRA LOW-TOKEN GEMINI AI SEO & TEAM NAME EXTRACTOR
+# ==========================================================
+def regex_extract_teams(title):
     patterns = [
-        r"([\w\s]+)\s+(?:vs\.?|versus|-)\s+([\w\s]+)",
-        r"([\w\s]+)\s+vs\s+([\w\s]+)",
+        r"([A-Za-z0-9\.\s]{2,25}?)\s+(?:vs\.?|versus|v)\s+([A-Za-z0-9\.\s]{2,25})(?:\s*[\|\-\(\[]|$)",
+        r"([\w\s]+)\s+vs\.?\s+([\w\s]+)",
     ]
     for pat in patterns:
         match = re.search(pat, title, re.IGNORECASE)
         if match:
-            t1 = match.group(1).strip().split('|')[-1].strip()
-            t2 = match.group(2).strip().split('|')[0].strip()
-            if len(t1) > 2 and len(t2) > 2:
+            t1 = match.group(1).strip().split('|')[-1].split('-')[-1].strip()
+            t2 = match.group(2).strip().split('|')[0].split('-')[0].strip()
+            if 2 <= len(t1) <= 25 and 2 <= len(t2) <= 25:
                 return f"{t1} vs {t2}"
-    return title
+    return None
 
-def generate_seo_description(game_name, match_title, teams_str, chapters, target_url):
-    """Generates an AI/SEO-optimized description utilizing minimal tokens."""
-    tags_str = " ".join([f"#{t}" for t in TOURNAMENT_CHANNELS.get(game_name.lower().replace(" ", ""), {}).get("tags", ["Esports", "Gaming"])])
-    desc = (
-        f"🔥 Epic pro highlights and best rounds from {teams_str} in this official {game_name} tournament match!\n\n"
-        f"Match: {match_title}\n\n"
-        f"⏱️ Match Chapters:\n{chapters}\n\n"
-        f"📌 Watch the full official stream here: {target_url}\n\n"
-        f"Like and subscribe for daily high-tier esports recaps, pro clutches, and tournament highlights!\n\n"
-        f"{tags_str} #Esports #Gaming #Highlights"
+def generate_ai_seo_metadata(game_cfg, raw_title, chapters, target_url):
+    teams_fallback = regex_extract_teams(raw_title) or game_cfg["name"]
+    seo_hook = f"Watch the highest-intensity pro rounds and clutch plays from {raw_title} ({game_cfg['name']})!"
+    extra_tags = []
+
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if api_key:
+        try:
+            from google import genai
+            client = genai.Client(api_key=api_key)
+            prompt = (
+                f"Esport:{game_cfg['name']}\nTitle:{raw_title}\n"
+                "Return strict JSON: {\"teams\":\"TeamA vs TeamB (or tournament name if Battle Royale)\","
+                "\"seo\":\"2-sentence high-CTR YouTube SEO summary with keywords\","
+                "\"tags\":[\"tag1\",\"tag2\",\"tag3\"]}"
+            )
+            resp = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config={"response_mime_type": "application/json", "max_output_tokens": 140}
+            )
+            data = json.loads(resp.text)
+            if data.get("teams"):
+                teams_fallback = data["teams"]
+            if data.get("seo"):
+                seo_hook = data["seo"]
+            if isinstance(data.get("tags"), list):
+                extra_tags = [str(t).replace("#", "") for t in data["tags"][:5]]
+            print(f"Gemini SEO generated! Matchup: {teams_fallback}")
+        except Exception as e:
+            print(f"Gemini SEO skipped ({e}), using regex fallback.")
+
+    all_tags = list(dict.fromkeys(game_cfg["tags"] + extra_tags + ["Esports", "Gaming", "TournamentHighlights"]))
+    hashtags = " ".join(f"#{t}" for t in all_tags[:8])
+
+    recap_title = f"{teams_fallback} - All Best Rounds & Clutches | {game_cfg['name']}"[:100]
+    recap_desc = (
+        f"🔥 {seo_hook}\n\n"
+        f"🎮 Match: {raw_title}\n"
+        f"🏆 Esport: {game_cfg['name']}\n\n"
+        f"⏱️ Round Highlights & Timestamps:\n{chapters}\n\n"
+        f"📺 Official Broadcast Source: {target_url}\n\n"
+        f"Subscribe for daily pro esports recaps, top clutches, and tournament highlights!\n\n"
+        f"{hashtags}"
     )
-    return desc
+    return teams_fallback, recap_title, recap_desc, all_tags
 
+# ==========================================================
+# HEATMAP & CLIPPING FUNCTIONS
+# ==========================================================
 def get_top_rounds(vod_url, num_rounds=8, clip_duration=45):
     try:
         info = extract_info_resilient(vod_url, {'skip_download': True})
@@ -212,8 +263,6 @@ def get_top_rounds(vod_url, num_rounds=8, clip_duration=45):
         raw_title = "Esports Tournament Highlights"
         heatmap = None
         duration = 1800
-
-    teams_title = clean_and_extract_teams(raw_title)
 
     peaks = []
     if heatmap:
@@ -245,7 +294,7 @@ def get_top_rounds(vod_url, num_rounds=8, clip_duration=45):
 
     chrono_rounds = sorted(peaks, key=lambda x: x['start'])
     best_shorts_rounds = sorted(peaks, key=lambda x: x['score'], reverse=True)
-    return raw_title, teams_title, chrono_rounds, best_shorts_rounds
+    return raw_title, chrono_rounds, best_shorts_rounds
 
 def download_round_clips(vod_url, rounds, output_dir="clips"):
     os.makedirs(output_dir, exist_ok=True)
@@ -438,16 +487,16 @@ def build_9_16_short(input_clip, output_short, game_cfg, match_title, round_rank
     ], check=True)
     return output_short
 
-def generate_custom_thumbnail(best_clip_path, game_cfg, match_title, output_thumb="thumbnail.jpg"):
+def generate_custom_thumbnail(best_clip_path, game_cfg, teams_title, match_title, output_thumb="thumbnail.jpg"):
     raw_frame = "raw_frame.jpg"
     subprocess.run([
-        "ffmpeg", "-y", "-ss", "27", "-i", best_clip_path,
+        "ffmpeg", "-y", "-ss", "22", "-i", best_clip_path,
         "-frames:v", "1", "-q:v", "2", raw_frame
     ], check=True)
 
     img = Image.open(raw_frame).convert("RGBA").resize((1280, 720), Image.Resampling.LANCZOS)
-    img = ImageEnhance.Color(img).enhance(1.30)
-    img = ImageEnhance.Contrast(img).enhance(1.15)
+    img = ImageEnhance.Color(img).enhance(1.35)
+    img = ImageEnhance.Contrast(img).enhance(1.18)
 
     if os.path.exists(WATERMARK_FILE):
         logo_thumb = Image.open(WATERMARK_FILE).convert("RGBA")
@@ -456,16 +505,16 @@ def generate_custom_thumbnail(best_clip_path, game_cfg, match_title, output_thum
 
     overlay = Image.new("RGBA", (1280, 720), (0, 0, 0, 0))
     draw_ov = ImageDraw.Draw(overlay)
-    for y in range(320, 720):
-        alpha = int(235 * ((y - 320) / 400) ** 1.3)
+    for y in range(290, 720):
+        alpha = int(240 * ((y - 290) / 430) ** 1.25)
         draw_ov.line([(0, y), (1280, y)], fill=(8, 10, 16, alpha))
 
     accent = game_cfg.get("accent", (255, 70, 85))
-    draw_ov.rectangle([0, 0, 1279, 719], outline=accent + (255,), width=10)
+    draw_ov.rectangle([0, 0, 1279, 719], outline=accent + (255,), width=12)
 
     game_label = game_cfg["name"].upper()
     font_badge = load_bold_font(42)
-    font_hero = load_bold_font(102)
+    font_hero = load_bold_font(94)
     font_sub = load_bold_font(44)
 
     badge_bbox = draw_ov.textbbox((0, 0), game_label, font=font_badge)
@@ -476,8 +525,9 @@ def generate_custom_thumbnail(best_clip_path, game_cfg, match_title, output_thum
     img = Image.alpha_composite(img, overlay)
     draw = ImageDraw.Draw(img)
 
+    hero_line = textwrap.shorten(teams_title.upper(), width=22, placeholder="...")
     draw.text(
-        (52, 465), "TOP ROUNDS",
+        (52, 465), hero_line,
         font=font_hero, fill=(255, 230, 0, 255),
         stroke_width=8, stroke_fill=(0, 0, 0, 255)
     )
@@ -489,9 +539,12 @@ def generate_custom_thumbnail(best_clip_path, game_cfg, match_title, output_thum
         stroke_width=4, stroke_fill=(0, 0, 0, 255)
     )
 
-    img.convert("RGB").save(output_thumb, "JPEG", quality=92)
+    img.convert("RGB").save(output_thumb, "JPEG", quality=93)
     return output_thumb
 
+# ==========================================================
+# YOUTUBE UPLOAD & AUTO-PLAYLIST SORTING
+# ==========================================================
 def get_youtube_client():
     creds = Credentials(
         token=None,
@@ -499,11 +552,81 @@ def get_youtube_client():
         token_uri="https://oauth2.googleapis.com/token",
         client_id=os.environ["YT_CLIENT_ID"],
         client_secret=os.environ["YT_CLIENT_SECRET"],
-        scopes=["https://www.googleapis.com/auth/youtube.upload"]
+        scopes=[
+            "https://www.googleapis.com/auth/youtube.upload",
+            "https://www.googleapis.com/auth/youtube"
+        ]
     )
     return build("youtube", "v3", credentials=creds)
 
-def upload_to_youtube(youtube, file_path, title, description, tags, thumbnail_path=None):
+def get_or_create_game_playlist(youtube, game_key, game_cfg):
+    """Finds or creates the dedicated playlist for this game and caches its ID."""
+    cache = {}
+    if os.path.exists(PLAYLIST_CACHE_FILE):
+        try:
+            with open(PLAYLIST_CACHE_FILE, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+        except Exception:
+            cache = {}
+
+    if game_key in cache and cache[game_key]:
+        return cache[game_key]
+
+    target_title = game_cfg.get("playlist_title", f"{game_cfg['name']} Highlights")
+    try:
+        # Check existing playlists on the channel first
+        req = youtube.playlists().list(part="snippet", mine=True, maxResults=50)
+        res = req.execute()
+        for item in res.get("items", []):
+            if item["snippet"]["title"].strip().lower() == target_title.lower():
+                pl_id = item["id"]
+                cache[game_key] = pl_id
+                with open(PLAYLIST_CACHE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(cache, f, indent=2)
+                return pl_id
+
+        # Not found -> Create new public playlist for this game
+        create_res = youtube.playlists().insert(
+            part="snippet,status",
+            body={
+                "snippet": {
+                    "title": target_title,
+                    "description": f"Official tournament highlights, full match recaps, and pro clutches for {game_cfg['name']}."
+                },
+                "status": {"privacyStatus": "public"}
+            }
+        ).execute()
+        pl_id = create_res["id"]
+        cache[game_key] = pl_id
+        with open(PLAYLIST_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2)
+        print(f"Created new YouTube Playlist [{target_title}] -> ID: {pl_id}")
+        return pl_id
+    except Exception as e:
+        print(f"Playlist lookup/creation skipped (Verify YT_REFRESH_TOKEN has 'youtube' scope): {e}")
+        return None
+
+def add_video_to_playlist(youtube, video_id, playlist_id):
+    if not playlist_id or not video_id:
+        return
+    try:
+        youtube.playlistItems().insert(
+            part="snippet",
+            body={
+                "snippet": {
+                    "playlistId": playlist_id,
+                    "resourceId": {
+                        "kind": "youtube#video",
+                        "videoId": video_id
+                    }
+                }
+            }
+        ).execute()
+        print(f"Sorted Video [{video_id}] into Playlist [{playlist_id}]")
+    except Exception as e:
+        print(f"Could not add video {video_id} to playlist: {e}")
+
+def upload_to_youtube(youtube, file_path, title, description, tags, thumbnail_path=None, playlist_id=None):
     body = {
         "snippet": {
             "title": title[:100],
@@ -520,7 +643,7 @@ def upload_to_youtube(youtube, file_path, title, description, tags, thumbnail_pa
         _, response = request.next_chunk()
 
     video_id = response['id']
-    print(f"Uploaded Video ID: {video_id}")
+    print(f"Uploaded YouTube Video ID: {video_id}")
 
     if thumbnail_path and os.path.exists(thumbnail_path):
         try:
@@ -532,7 +655,166 @@ def upload_to_youtube(youtube, file_path, title, description, tags, thumbnail_pa
         except Exception as e:
             print(f"Note: Custom thumbnail upload skipped: {e}")
 
+    if playlist_id:
+        add_video_to_playlist(youtube, video_id, playlist_id)
+
     return video_id
+
+# ==========================================================
+# MULTI-PLATFORM DISTRIBUTION (FACEBOOK, INSTAGRAM, TIKTOK)
+# ==========================================================
+def share_youtube_link_on_facebook(yt_video_id, message):
+    fb_page_id = os.environ.get("FB_PAGE_ID", "").strip()
+    fb_token = os.environ.get("FB_PAGE_ACCESS_TOKEN", "").strip()
+    if not fb_page_id or not fb_token:
+        print("FB_PAGE_ID or FB_PAGE_ACCESS_TOKEN not set; skipping Facebook link post.")
+        return
+
+    yt_link = f"https://www.youtube.com/watch?v={yt_video_id}"
+    url = f"https://graph.facebook.com/v21.0/{fb_page_id}/feed"
+    resp = requests.post(url, data={
+        "message": f"{message}\n\n📺 Watch Full HD Match Recap: {yt_link}",
+        "link": yt_link,
+        "access_token": fb_token
+    }, timeout=30)
+    print(f"Facebook Link Post Response ({resp.status_code}): {resp.text}")
+
+def upload_short_to_facebook_reels(video_path, caption):
+    fb_page_id = os.environ.get("FB_PAGE_ID", "").strip()
+    fb_token = os.environ.get("FB_PAGE_ACCESS_TOKEN", "").strip()
+    if not fb_page_id or not fb_token:
+        return
+
+    try:
+        init_url = f"https://graph.facebook.com/v21.0/{fb_page_id}/video_reels"
+        init_res = requests.post(init_url, data={
+            "upload_phase": "start",
+            "access_token": fb_token
+        }, timeout=30).json()
+        video_id = init_res.get("video_id")
+        upload_url = init_res.get("upload_url")
+        if not video_id or not upload_url:
+            print(f"FB Reels init failed: {init_res}")
+            return
+
+        file_size = os.path.getsize(video_path)
+        with open(video_path, "rb") as f:
+            headers = {
+                "Authorization": f"OAuth {fb_token}",
+                "offset": "0",
+                "file_size": str(file_size)
+            }
+            requests.post(upload_url, headers=headers, data=f, timeout=180)
+
+        fin_res = requests.post(init_url, data={
+            "upload_phase": "finish",
+            "video_id": video_id,
+            "video_state": "PUBLISHED",
+            "description": caption,
+            "access_token": fb_token
+        }, timeout=30).json()
+        print(f"Facebook Reel Published: {fin_res}")
+    except Exception as e:
+        print(f"Facebook Reel upload error: {e}")
+
+def upload_temp_public_url(video_path):
+    with open(video_path, "rb") as f:
+        resp = requests.post(
+            "https://litterbox.catbox.moe/resources/internals/api.php",
+            data={"reqtype": "fileupload", "time": "1h"},
+            files={"fileToUpload": f},
+            timeout=120
+        )
+    if resp.status_code == 200 and resp.text.startswith("http"):
+        return resp.text.strip()
+    return None
+
+def upload_short_to_instagram_reels(video_path, caption):
+    ig_user_id = os.environ.get("IG_USER_ID", "").strip()
+    fb_token = os.environ.get("FB_PAGE_ACCESS_TOKEN", "").strip()
+    if not ig_user_id or not fb_token:
+        return
+
+    try:
+        public_video_url = upload_temp_public_url(video_path)
+        if not public_video_url:
+            print("Could not stage temporary URL for Instagram Reels.")
+            return
+
+        create_url = f"https://graph.facebook.com/v21.0/{ig_user_id}/media"
+        container = requests.post(create_url, data={
+            "media_type": "REELS",
+            "video_url": public_video_url,
+            "caption": caption,
+            "access_token": fb_token
+        }, timeout=30).json()
+
+        creation_id = container.get("id")
+        if not creation_id:
+            print(f"IG Reel container error: {container}")
+            return
+
+        for _ in range(12):
+            time.sleep(10)
+            status_res = requests.get(
+                f"https://graph.facebook.com/v21.0/{creation_id}",
+                params={"fields": "status_code", "access_token": fb_token},
+                timeout=20
+            ).json()
+            if status_res.get("status_code") == "FINISHED":
+                break
+
+        pub_res = requests.post(
+            f"https://graph.facebook.com/v21.0/{ig_user_id}/media_publish",
+            data={"creation_id": creation_id, "access_token": fb_token},
+            timeout=30
+        ).json()
+        print(f"Instagram Reel Published: {pub_res}")
+    except Exception as e:
+        print(f"Instagram Reel upload error: {e}")
+
+def upload_short_to_tiktok(video_path, title):
+    tt_token = os.environ.get("TIKTOK_ACCESS_TOKEN", "").strip()
+    if not tt_token:
+        return
+
+    try:
+        file_size = os.path.getsize(video_path)
+        init_url = "https://open.tiktokapis.com/v2/post/publish/video/init/"
+        headers = {
+            "Authorization": f"Bearer {tt_token}",
+            "Content-Type": "application/json; charset=UTF-8"
+        }
+        payload = {
+            "post_info": {
+                "title": title[:150],
+                "privacy_level": "PUBLIC_TO_EVERYONE",
+                "disable_duet": False,
+                "disable_comment": False,
+                "disable_stitch": False
+            },
+            "source_info": {
+                "source": "FILE_UPLOAD",
+                "video_size": file_size,
+                "chunk_size": file_size,
+                "total_chunk_count": 1
+            }
+        }
+        init_res = requests.post(init_url, headers=headers, json=payload, timeout=30).json()
+        upload_url = init_res.get("data", {}).get("upload_url")
+        if not upload_url:
+            print(f"TikTok init response: {init_res}")
+            return
+
+        with open(video_path, "rb") as f:
+            put_headers = {
+                "Content-Range": f"bytes 0-{file_size - 1}/{file_size}",
+                "Content-Type": "video/mp4"
+            }
+            put_res = requests.put(upload_url, headers=put_headers, data=f, timeout=180)
+            print(f"TikTok Upload Status: {put_res.status_code}")
+    except Exception as e:
+        print(f"TikTok upload error: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -572,10 +854,15 @@ if __name__ == "__main__":
     game_cfg = TOURNAMENT_CHANNELS[selected_game]
     print(f"New Match Found! Processing [{game_cfg['name']}] VOD: {target_url}")
 
-    raw_title, teams_title, chrono_rounds, best_rounds = get_top_rounds(target_url, num_rounds=8, clip_duration=45)
+    raw_title, chrono_rounds, best_rounds = get_top_rounds(target_url, num_rounds=8, clip_duration=45)
     download_round_clips(target_url, chrono_rounds)
     recap_file, chapters = build_16_9_recap(chrono_rounds)
-    thumb_file = generate_custom_thumbnail(best_rounds[0]['file_path'], game_cfg, raw_title)
+
+    teams_title, recap_title, recap_desc, seo_tags = generate_ai_seo_metadata(
+        game_cfg, raw_title, chapters, target_url
+    )
+
+    thumb_file = generate_custom_thumbnail(best_rounds[0]['file_path'], game_cfg, teams_title, raw_title)
 
     short_files = []
     for i in range(min(args.shorts_count, len(best_rounds))):
@@ -584,28 +871,47 @@ if __name__ == "__main__":
             best_rounds[i]['file_path'],
             out_short,
             game_cfg=game_cfg,
-            match_title=raw_title,
+            match_title=f"{teams_title} - {raw_title}",
             round_rank=i+1
         )
         short_files.append((out_short, best_rounds[i]['score']))
 
     if args.upload:
         yt = get_youtube_client()
-        
-        # Build optimized title and description with extracted teams
-        recap_title = f"{teams_title} - Best Rounds & Highlights ({game_cfg['name']})"
-        recap_desc = generate_seo_description(game_cfg['name'], raw_title, teams_title, chapters, target_url)
 
-        upload_to_youtube(
+        # Find or auto-create the dedicated playlist for this game
+        playlist_id = get_or_create_game_playlist(yt, selected_game, game_cfg)
+
+        # 1. Upload 16:9 Full Match Recap + Custom Thumbnail + Sort into Game Playlist
+        recap_vid_id = upload_to_youtube(
             yt, recap_file,
             recap_title,
-            recap_desc, game_cfg["tags"],
-            thumbnail_path=thumb_file
+            recap_desc, seo_tags,
+            thumbnail_path=thumb_file,
+            playlist_id=playlist_id
         )
 
+        # 2. Share the 16:9 YouTube Video as a Link Post on Facebook Page
+        share_youtube_link_on_facebook(
+            recap_vid_id,
+            f"🔥 {recap_title}\n\nWatch all the best pro clutches and highlights from {teams_title}!"
+        )
+
+        # 3. Upload 9:16 Shorts to YouTube (sorted into Game Playlist), IG Reels, FB Reels & TikTok
         for idx, (s_file, score) in enumerate(short_files):
-            s_title = f"{teams_title} Insane Clutch #{idx+1} 🔥 {game_cfg['name']} #Shorts"
-            s_desc = f"Most replayed moment from {teams_title} ({game_cfg['name']}) #Shorts #{' #'.join(game_cfg['tags'])}"
-            upload_to_youtube(yt, s_file, s_title, s_desc, game_cfg["tags"] + ["Shorts"])
+            s_title = f"{teams_title} Insane Tournament Clutch #{idx+1} 🔥 {game_cfg['name']} #Shorts"
+            s_caption = (
+                f"{teams_title} Insane Clutch #{idx+1} 🔥 ({game_cfg['name']})\n"
+                f"Match: {raw_title}\n"
+                f"#Shorts #Reels #Esports #{' #'.join(game_cfg['tags'])}"
+            )
+            upload_to_youtube(
+                yt, s_file, s_title, s_caption,
+                seo_tags + ["Shorts"],
+                playlist_id=playlist_id
+            )
+            upload_short_to_facebook_reels(s_file, s_caption)
+            upload_short_to_instagram_reels(s_file, s_caption)
+            upload_short_to_tiktok(s_file, s_caption)
 
     mark_vod_as_processed(target_id, selected_game, raw_title)
