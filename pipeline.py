@@ -156,7 +156,6 @@ def find_and_download_vod(game_key: str) -> tuple[Path, dict]:
                 data = json.loads(line)
                 vid_id = data.get("id")
                 duration = data.get("duration") or 0
-                # Filter for standard single tournament match VODs (20 mins to 2 hours) to avoid huge streams hanging
                 if vid_id and vid_id not in processed_ids and 1200 <= duration <= 7200:
                     candidates.append(f"https://www.youtube.com/watch?v={vid_id}")
             except Exception:
@@ -283,8 +282,9 @@ Watch this {total_duration:.0f}-second match video and return the exact timestam
   "short_segments": [{{"start": 120.0, "end": 178.0}}]
 }}
 """
+        # Updated to use gemini-3.8-flash (current GA stable reference)
         resp = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.8-flash",
             contents=[uploaded_file, prompt],
             config=types.GenerateContentConfig(temperature=0.1)
         )
@@ -329,7 +329,9 @@ def render_16x9_recap(source_vod: Path, segments: list[tuple[float, float]], out
 def generate_custom_thumbnail(source_vod: Path, thumb_sec: float, game_key: str, headline: str, out_jpg: Path):
     raw_frame = (WORK_DIR / "thumb_raw.jpg").resolve()
     subprocess.run(["ffmpeg", "-y", "-ss", str(thumb_sec), "-i", str(source_vod.resolve()), "-frames:v", "1", str(raw_frame)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    img = Image.open(raw_frame).convert("RGBA").resize((1280, 720), Image.Resampling.LANCZOS)
+    
+    # FIXED: Converted to RGB to prevent KeyError: 'RGBA' when saving as JPEG
+    img = Image.open(raw_frame).convert("RGB").resize((1280, 720), Image.Resampling.LANCZOS)
     img.save(out_jpg.resolve(), "JPEG", quality=92)
 
 
@@ -348,12 +350,29 @@ def render_9x16_short(source_vod: Path, short_window: tuple[float, float], game_
 
 def generate_seo_metadata(vod_title: str, game_key: str) -> dict:
     game_info = GAME_CONFIG[game_key]
-    return {
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    
+    fallback = {
         "match_headline": vod_title[:32],
         "yt_title": f"{vod_title[:60]} | Highlights ({game_info['name']})",
         "yt_description": f"{vod_title} - Full Match Highlights!\n{game_info['hashtags']} #TheRippersGaming",
-        "short_caption": f"INSANE {game_info['name']} Moment! 🔥 {game_info['hashtags']} #TheRippersGaming"
+        "short_caption": f"INSANE {game_info['name']} Tournament Moment! 🔥 {game_info['hashtags']} #TheRippersGaming"
     }
+    
+    if not api_key:
+        return fallback
+
+    try:
+        client = genai.Client(api_key=api_key)
+        # Updated to use gemini-3.8-flash
+        resp = client.models.generate_content(
+            model="gemini-3.8-flash",
+            contents=f"Source VOD Title: '{vod_title}' | Game: {game_info['name']}. Return ONLY raw JSON with keys: 'match_headline', 'yt_title', 'yt_description', 'short_caption'."
+        )
+        parsed = json.loads(re.sub(r"^```json|```$", "", resp.text.strip(), flags=re.MULTILINE).strip())
+        return {**fallback, **parsed}
+    except Exception:
+        return fallback
 
 
 def get_youtube_client():
