@@ -12,6 +12,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance
 
 from google import genai
+from google.genai import types
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -26,8 +27,8 @@ GAME_CONFIG = {
         "type": "tactical",
         "accent_color": (255, 70, 85),
         "queries": [
-            "Valorant Champions Tour VCT full match map VOD",
-            "VCT Americas EMEA Pacific Grand Final full match"
+            "Valorant Champions Tour VCT full match VOD",
+            "VCT Americas EMEA Pacific Grand Final live stream VOD"
         ],
         "playlist_title": "VALORANT Tournament Highlights & Full Recaps",
         "hashtags": "#Valorant #VCT #ValorantClips #ValorantEsports #Gaming"
@@ -38,7 +39,7 @@ GAME_CONFIG = {
         "accent_color": (220, 38, 38),
         "queries": [
             "ALGS Apex Legends Global Series Finals full match VOD",
-            "ALGS Pro League Match Point Finals full game"
+            "ALGS Pro League Match Point Finals full stream"
         ],
         "playlist_title": "Apex Legends ALGS Final Circles & Best Fights",
         "hashtags": "#ApexLegends #ALGS #ApexClips #BattleRoyale #Esports"
@@ -48,8 +49,8 @@ GAME_CONFIG = {
         "type": "tactical",
         "accent_color": (245, 158, 11),
         "queries": [
-            "CS2 ESL Pro League BLAST Premier full match map VOD",
-            "CS2 Major Playoffs full match highlight VOD"
+            "CS2 ESL Pro League BLAST Premier full match VOD",
+            "CS2 Major Playoffs Grand Final full match"
         ],
         "playlist_title": "CS2 Pro Match Recaps & Highlights",
         "hashtags": "#CS2 #CounterStrike2 #CS2Clips #ESL #Esports"
@@ -60,7 +61,7 @@ GAME_CONFIG = {
         "accent_color": (234, 179, 8),
         "queries": [
             "PUBG Global Series PGS PGC Grand Finals full match VOD",
-            "PUBG Esports Tournament Grand Final Match VOD"
+            "PUBG Esports Tournament Grand Final stream"
         ],
         "playlist_title": "PUBG Tournament Final Circles & Recaps",
         "hashtags": "#PUBG #PUBGEsports #BattleRoyale #PUBGClips #Gaming"
@@ -71,7 +72,7 @@ GAME_CONFIG = {
         "accent_color": (56, 189, 248),
         "queries": [
             "FNCS Fortnite Championship Series Grand Finals full game VOD",
-            "Fortnite FNCS Major Finals full match"
+            "Fortnite FNCS Major Finals broadcast VOD"
         ],
         "playlist_title": "Fortnite FNCS Endgames & Best Fights",
         "hashtags": "#Fortnite #FNCS #FortniteClips #FortniteCompetitive #Gaming"
@@ -82,7 +83,7 @@ GAME_CONFIG = {
         "accent_color": (59, 130, 246),
         "queries": [
             "Rainbow Six Siege Six Invitational Pro League full match VOD",
-            "R6 Esports Major Playoffs full map VOD"
+            "R6 Esports Major Playoffs full match"
         ],
         "playlist_title": "Rainbow Six Siege Pro Recaps",
         "hashtags": "#R6Siege #RainbowSixSiege #R6Esports #FPS #Gaming"
@@ -159,7 +160,7 @@ def select_target_game() -> str:
 
 
 # ==============================================================================
-# 3. YOUTUBE VOD DISCOVERY & ROBUST DOWNLOADER
+# 3. 8-HOUR STREAM SLICER & YOUTUBE VOD DOWNLOADER
 # ==============================================================================
 def get_ytdlp_base_args() -> list[str]:
     args = [
@@ -172,6 +173,33 @@ def get_ytdlp_base_args() -> list[str]:
     if cookie_file.exists() and cookie_file.stat().st_size > 40:
         args.extend(["--cookies", str(cookie_file)])
     return args
+
+
+def pick_best_match_window_from_long_stream(info_data: dict) -> tuple[int, int] | None:
+    """
+    If a VOD is a multi-hour stream (e.g., 2 to 10 hours), extracts a single 42-minute
+    active match window so GitHub Actions downloads it in ~90 seconds instead of timing out!
+    """
+    duration = int(info_data.get("duration") or 0)
+    if duration <= 3300:  # Under 55 minutes: download full VOD normally
+        return None
+
+    chapters = info_data.get("chapters") or []
+    # Check if stream has YouTube chapters for a specific Game/Map/Match
+    for ch in reversed(chapters):
+        ch_start = int(ch.get("start_time") or 0)
+        ch_end = int(ch.get("end_time") or 0)
+        ch_dur = ch_end - ch_start
+        title = (ch.get("title") or "").lower()
+        if 1200 <= ch_dur <= 3600 and not any(w in title for w in ["pre-show", "countdown", "break", "interview", "desk"]):
+            print(f"[+] Found Chapter Match Window '{ch.get('title')}': {ch_start}s to {ch_end}s")
+            return ch_start, min(duration, ch_start + 2520)
+
+    # Otherwise, target the prime Grand Finals / Main Event window (65% into the broadcast, 42 mins long)
+    slice_start = max(1800, int(duration * 0.65) - 1260)
+    slice_end = min(duration - 300, slice_start + 2520)
+    print(f"[*] Long {duration/3600:.1f}-Hour Stream Detected! Slicing 42-min Prime Match Window ({slice_start}s - {slice_end}s)...")
+    return slice_start, slice_end
 
 
 def find_and_download_vod(game_key: str) -> tuple[Path, dict]:
@@ -189,7 +217,7 @@ def find_and_download_vod(game_key: str) -> tuple[Path, dict]:
         search_cmd = get_ytdlp_base_args() + [
             "--dump-json",
             "--flat-playlist",
-            f"ytsearch20:{query}"
+            f"ytsearch25:{query}"
         ]
         res = subprocess.run(search_cmd, capture_output=True, text=True)
         for line in res.stdout.splitlines():
@@ -197,7 +225,8 @@ def find_and_download_vod(game_key: str) -> tuple[Path, dict]:
                 data = json.loads(line)
                 vid_id = data.get("id")
                 duration = data.get("duration") or 0
-                if vid_id and vid_id not in processed_ids and 1080 <= duration <= 5700:
+                # Accept BOTH single matches (18 mins) AND full 8-to-12 hour tournament broadcasts!
+                if vid_id and vid_id not in processed_ids and 1080 <= duration <= 43200:
                     candidates.append(f"https://www.youtube.com/watch?v={vid_id}")
             except Exception:
                 continue
@@ -206,49 +235,49 @@ def find_and_download_vod(game_key: str) -> tuple[Path, dict]:
         raise RuntimeError(f"No suitable unprocessed VODs found for {game_info['name']}.")
 
     for url in candidates[:4]:
-        print(f"[*] Attempting download: {url}")
+        print(f"[*] Inspecting metadata for: {url}")
+        meta_cmd = get_ytdlp_base_args() + ["--dump-single-json", url]
+        meta_proc = subprocess.run(meta_cmd, capture_output=True, text=True)
+        if meta_proc.returncode != 0:
+            continue
+
+        try:
+            info_data = json.loads(meta_proc.stdout)
+        except Exception:
+            continue
+
+        window = pick_best_match_window_from_long_stream(info_data)
+
         dl_cmd = get_ytdlp_base_args() + [
             "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best",
             "--merge-output-format", "mp4",
-            "--write-info-json",
+            "--concurrent-fragments", "8",
             "-o", output_template,
-            url
         ]
+        if window:
+            s_sec, e_sec = window
+            dl_cmd.extend(["--download-sections", f"*{s_sec}-{e_sec}", "--force-keyframes-at-cuts"])
+
+        dl_cmd.append(url)
+        print(f"[*] Downloading match video from {url}...")
         proc = subprocess.run(dl_cmd)
         mp4_path = (WORK_DIR / "source_vod.mp4").resolve()
-        info_path = (WORK_DIR / "source_vod.info.json").resolve()
         if proc.returncode == 0 and mp4_path.exists():
-            info_data = {}
-            if info_path.exists():
-                info_data = json.loads(info_path.read_text(encoding="utf-8", errors="ignore"))
             return mp4_path, info_data
 
     raise RuntimeError("All VOD download attempts failed.")
 
 
 # ==============================================================================
-# 4. SMART HIGHLIGHT ENGINE (EXTENDED POST-ROUND & FULL FINAL CIRCLE)
+# 4. GEMINI MULTIMODAL AI VIDEO CLIPPER (WATCHES SCOREBOARD/HUD SO FIGHTS NEVER CUT)
 # ==============================================================================
-def get_smart_highlight_segments(video_path: Path, game_key: str) -> tuple[list[tuple[float, float]], list[float]]:
+def get_audio_fallback_segments(video_path: Path, game_key: str, total_duration: float) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
     """
-    Ensures rounds and fights NEVER cut off early:
-    - Tactical games: 18s pre-peak + 42s post-peak (60s per full round) across 20 rounds.
-    - Battle Royale: 25s pre-peak + 70s post-peak (95s per full squad fight) + 5.5-min Final Circle.
+    Smart silence-aware audio fallback if Gemini API fails:
+    Detects the peak AND extends the clip until caster/gunfire energy naturally drops (round break).
     """
-    game_info = GAME_CONFIG[game_key]
-    game_type = game_info["type"]
-
-    probe_cmd = [
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", str(video_path.resolve())
-    ]
-    total_duration = float(subprocess.check_output(probe_cmd).decode().strip())
-
-    # Extract 1-second RMS audio energy profile using ffmpeg at 8000Hz mono
-    pcm_cmd = [
-        "ffmpeg", "-i", str(video_path.resolve()), "-vn", "-ac", "1", "-ar", "8000",
-        "-f", "s16le", "-"
-    ]
+    game_type = GAME_CONFIG[game_key]["type"]
+    pcm_cmd = ["ffmpeg", "-i", str(video_path.resolve()), "-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "-"]
     proc = subprocess.Popen(pcm_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     raw_audio, _ = proc.communicate()
     audio_samples = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32)
@@ -256,97 +285,218 @@ def get_smart_highlight_segments(video_path: Path, game_key: str) -> tuple[list[
     samples_per_sec = 8000
     num_seconds = len(audio_samples) // samples_per_sec
     if num_seconds < 240:
-        return [(0.0, total_duration)], [total_duration / 2]
+        return [(0.0, total_duration)], [(10.0, min(68.0, total_duration))]
 
     trimmed = audio_samples[:num_seconds * samples_per_sec].reshape((num_seconds, samples_per_sec))
     rms_per_sec = np.sqrt(np.mean(trimmed ** 2, axis=1))
-    smoothed_energy = np.convolve(rms_per_sec, np.ones(5) / 5.0, mode="same")
+    smoothed = np.convolve(rms_per_sec, np.ones(5) / 5.0, mode="same")
+    median_energy = float(np.median(smoothed))
 
-    start_bound = min(90, int(num_seconds * 0.05))
-    end_bound = max(num_seconds - 40, int(num_seconds * 0.96))
+    start_bound = min(60, int(num_seconds * 0.04))
+    end_bound = max(num_seconds - 30, int(num_seconds * 0.96))
 
-    # Find top 5 absolute hype peaks across the match for 9:16 Vertical Shorts
-    shorts_energy = smoothed_energy.copy()
+    def find_natural_round_end(peak_s: int, min_tail: int, max_tail: int) -> float:
+        # Walk forward from peak_s + min_tail until audio drops to calm post-round lull (+5s buffer)
+        search_start = min(num_seconds - 5, peak_s + min_tail)
+        search_end = min(num_seconds - 2, peak_s + max_tail)
+        for t in range(search_start, search_end):
+            if smoothed[t] < median_energy * 0.95:
+                return float(min(total_duration, t + 6.0))
+        return float(min(total_duration, search_end))
+
+    # Build Short windows (exact start_sec, end_sec that end after the round finishes)
+    shorts_energy = smoothed.copy()
     shorts_energy[:start_bound] = 0
     shorts_energy[end_bound:] = 0
-    top_peaks = []
+    short_windows = []
     for _ in range(5):
         p = int(np.argmax(shorts_energy))
         if shorts_energy[p] <= 0:
             break
-        top_peaks.append(float(p))
-        shorts_energy[max(0, p - 75):min(num_seconds, p + 75)] = 0
+        s_end = find_natural_round_end(p, min_tail=32, max_tail=48)
+        s_start = max(5.0, s_end - 58.0)
+        short_windows.append((round(s_start, 2), round(s_end, 2)))
+        shorts_energy[max(0, p - 80):min(num_seconds, p + 80)] = 0
 
     segments = []
-
     if game_type == "battle_royale":
-        print(f"[*] Battle Royale Mode ({game_info['name']}): Full 95s Fights + Complete 5.5-Min Final Circle...")
-        midgame_cutoff = int(start_bound + (end_bound - start_bound) * 0.70)
+        mid_cut = int(start_bound + (end_bound - start_bound) * 0.70)
+        end_slice = smoothed[mid_cut:end_bound]
+        climax = (mid_cut + int(np.argmax(end_slice))) if len(end_slice) > 0 else (end_bound - 45)
+        fc_start = max(start_bound, climax - 270)
+        fc_end = min(total_duration, climax + 65)
 
-        # 1. Lock onto the Final Circle Climax in the last 30% of the VOD
-        endgame_slice = smoothed_energy[midgame_cutoff:end_bound]
-        climax_sec = (midgame_cutoff + int(np.argmax(endgame_slice))) if len(endgame_slice) > 0 else (end_bound - 45)
-
-        # Capture continuous 5.5-minute Final Circle showdown (270s lead-up + 60s winner celebration)
-        final_circle_start = max(start_bound, climax_sec - 270)
-        final_circle_end = min(total_duration, climax_sec + 60)
-
-        # 2. Extract Top 7 Complete Mid-Game Squad Fights (95s each: 25s engage + 70s full squad wipe & reset)
-        energy_copy = smoothed_energy.copy()
-        energy_copy[:start_bound] = 0
-        energy_copy[max(0, final_circle_start - 20):] = 0
-
+        ec = smoothed.copy()
+        ec[:start_bound] = 0
+        ec[max(0, fc_start - 20):] = 0
         for _ in range(7):
-            peak_sec = int(np.argmax(energy_copy))
-            if energy_copy[peak_sec] <= 0:
+            p = int(np.argmax(ec))
+            if ec[p] <= 0:
                 break
-            f_start = max(start_bound, peak_sec - 25)
-            f_end = min(final_circle_start - 5, peak_sec + 70)
-            if f_end - f_start >= 45:
-                segments.append((float(f_start), float(f_end)))
-            energy_copy[max(0, peak_sec - 75):min(num_seconds, peak_sec + 75)] = 0
-
-        # Append the unbroken Final Circle climax at the end
-        segments.append((float(final_circle_start), float(final_circle_end)))
-
+            f_start = max(float(start_bound), float(p - 25))
+            f_end = min(float(fc_start - 5), find_natural_round_end(p, min_tail=50, max_tail=85))
+            if f_end - f_start >= 40:
+                segments.append((f_start, f_end))
+            ec[max(0, p - 80):min(num_seconds, p + 80)] = 0
+        segments.append((float(fc_start), float(fc_end)))
     else:
-        print(f"[*] Tactical Mode ({game_info['name']}): Extracting 20 Full Rounds (60s per round w/ 42s post-peak tail)...")
-        # Entry spike happens mid-round -> 18s before spike + 42s after spike ensures round end is ALWAYS shown
-        num_rounds = 20
-        pre_pad = 18   # Build-up & site execute
-        post_pad = 42  # Full post-plant, clutch finish, round-win banner & caster reaction
-
-        energy_copy = smoothed_energy.copy()
-        energy_copy[:start_bound] = 0
-        energy_copy[end_bound:] = 0
-
-        for _ in range(num_rounds):
-            peak_sec = int(np.argmax(energy_copy))
-            if energy_copy[peak_sec] <= 0:
+        ec = smoothed.copy()
+        ec[:start_bound] = 0
+        ec[end_bound:] = 0
+        for _ in range(18):
+            p = int(np.argmax(ec))
+            if ec[p] <= 0:
                 break
-            r_start = max(start_bound, peak_sec - pre_pad)
-            r_end = min(total_duration, peak_sec + post_pad)
-            segments.append((float(r_start), float(r_end)))
-            # Mask out surrounding window so we pick distinct rounds across the whole match
-            energy_copy[max(0, peak_sec - 45):min(num_seconds, peak_sec + 50)] = 0
+            r_start = max(float(start_bound), float(p - 20))
+            r_end = find_natural_round_end(p, min_tail=35, max_tail=65)
+            segments.append((r_start, r_end))
+            ec[max(0, p - 50):min(num_seconds, p + 55)] = 0
 
-    # Sort chronologically and merge overlapping or adjacent clips within 8 seconds
     segments.sort(key=lambda x: x[0])
     merged = []
     for seg in segments:
         if not merged:
             merged.append(list(seg))
+        elif seg[0] <= merged[-1][1] + 8.0:
+            merged[-1][1] = max(merged[-1][1], seg[1])
         else:
-            prev = merged[-1]
-            if seg[0] <= prev[1] + 8.0:
-                prev[1] = max(prev[1], seg[1])
-            else:
-                merged.append(list(seg))
+            merged.append(list(seg))
+    return [(round(s[0], 2), round(s[1], 2)) for s in merged], short_windows
 
-    final_segments = [(round(s[0], 2), round(s[1], 2)) for s in merged]
-    total_mins = sum(e - s for s, e in final_segments) / 60.0
-    print(f"[+] Built {len(final_segments)} chronological segments | Total Recap Duration: {total_mins:.1f} minutes")
-    return final_segments, top_peaks
+
+def get_ai_highlight_segments(video_path: Path, game_key: str) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """
+    Uses Google Gemini 2.5 Pro / Flash Multimodal Video Understanding to watch the match
+    (scoreboard, killfeed, round-won banners, final circle) and return exact start/end timestamps
+    so a round or fight is NEVER cut mid-action!
+    """
+    probe_cmd = [
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1", str(video_path.resolve())
+    ]
+    total_duration = float(subprocess.check_output(probe_cmd).decode().strip())
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    game_info = GAME_CONFIG[game_key]
+
+    if not api_key:
+        print("[!] No GEMINI_API_KEY found, using silence-aware audio detector...")
+        return get_audio_fallback_segments(video_path, game_key, total_duration)
+
+    try:
+        print(f"[*] Creating lightweight 360p AI Vision Proxy for Gemini Multimodal Clipping...")
+        proxy_mp4 = (WORK_DIR / "ai_proxy.mp4").resolve()
+        # Fast 360p @ 2fps + 32k mono audio proxy (~25MB for a 40-min match, encodes in ~20s)
+        subprocess.run([
+            "ffmpeg", "-y", "-i", str(video_path.resolve()),
+            "-vf", "scale=640:360", "-r", "2",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "32",
+            "-c:a", "aac", "-b:a", "32k", "-ac", "1", "-ar", "16000",
+            str(proxy_mp4)
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+        client = genai.Client(api_key=api_key)
+        print("[*] Uploading match proxy to Gemini Files API for AI Visual & Audio Analysis...")
+        uploaded_file = client.files.upload(file=str(proxy_mp4))
+
+        # Wait for Gemini video processing to complete
+        while uploaded_file.state.name == "PROCESSING":
+            time.sleep(5)
+            uploaded_file = client.files.get(name=uploaded_file.name)
+
+        if uploaded_file.state.name != "ACTIVE":
+            raise RuntimeError(f"Gemini file state error: {uploaded_file.state.name}")
+
+        is_br = game_info["type"] == "battle_royale"
+        mode_instructions = (
+            "This is a BATTLE ROYALE tournament match (Apex Legends / PUBG / Fortnite). "
+            "Identify the 7 best complete early/mid-game squad fights (from initial engagement until the full squad wipe finishes + 4 seconds) "
+            "AND include the COMPLETE, UNBROKEN Final Circle showdown (the last 4.5 to 6 minutes of the match all the way through the Champion/Winner screen)."
+            if is_br else
+            f"This is a TACTICAL tournament match ({game_info['name']}). "
+            "Identify the 16 to 20 best full rounds. "
+            "CRITICAL RULE: Look at the top HUD timer, killfeed, and Round-End Banner ('ROUND WON', 'VICTORY', 'CLUTCH'). "
+            "Every clip MUST start during the round execute/engage and MUST NOT END until 4 seconds AFTER the final kill of the round and the Round-Won banner appears on screen. NEVER cut mid-fight!"
+        )
+
+        prompt = f"""
+You are an elite esports video editor watching a {total_duration:.0f}-second {game_info['name']} tournament VOD.
+{mode_instructions}
+
+Also select the top 3 most explosive single-round clutches or squad wipes for vertical Shorts (each Short window must be between 45 and 58 seconds long, and MUST end 3-4 seconds AFTER the final kill / round-win banner so the fight finishes completely).
+
+Return ONLY raw valid JSON in this exact structure:
+{{
+  "recap_segments": [
+    {{"start": 120.0, "end": 185.0, "reason": "Full Round 3 execute and 1v2 clutch finish"}}
+  ],
+  "short_segments": [
+    {{"start": 410.0, "end": 466.0, "reason": "Full ace clutch through round win banner"}}
+  ]
+}}
+"""
+        # Try Gemini 2.5 Pro first (since user has Google Pro account), fallback to 2.5 Flash
+        try:
+            resp = client.models.generate_content(
+                model="gemini-2.5-pro",
+                contents=[uploaded_file, prompt],
+                config=types.GenerateContentConfig(temperature=0.1)
+            )
+        except Exception:
+            resp = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[uploaded_file, prompt],
+                config=types.GenerateContentConfig(temperature=0.1)
+            )
+
+        # Clean up remote file and local proxy
+        try:
+            client.files.delete(name=uploaded_file.name)
+        except Exception:
+            pass
+        proxy_mp4.unlink(missing_ok=True)
+
+        raw_json = re.sub(r"^```json|```$", "", resp.text.strip(), flags=re.MULTILINE).strip()
+        data = json.loads(raw_json)
+
+        recap_raw = data.get("recap_segments", [])
+        shorts_raw = data.get("short_segments", [])
+
+        segments = []
+        for item in recap_raw:
+            s = max(0.0, float(item["start"]) - 2.0)  # 2s safety lead-in
+            e = min(total_duration, float(item["end"]) + 4.0)  # 4s safety tail so fight NEVER cuts early
+            if e - s >= 15.0:
+                segments.append((s, e))
+
+        short_windows = []
+        for item in shorts_raw:
+            s = max(0.0, float(item["start"]))
+            e = min(total_duration, float(item["end"]) + 3.0)  # 3s safety tail after round end
+            if e - s > 58.0:
+                s = e - 58.0  # Anchor to the END of the fight so the final kill is never lost!
+            elif e - s < 35.0:
+                s = max(0.0, e - 50.0)
+            short_windows.append((round(s, 2), round(e, 2)))
+
+        if len(segments) >= 4 and len(short_windows) >= 1:
+            segments.sort(key=lambda x: x[0])
+            merged = []
+            for seg in segments:
+                if not merged:
+                    merged.append(list(seg))
+                elif seg[0] <= merged[-1][1] + 6.0:
+                    merged[-1][1] = max(merged[-1][1], seg[1])
+                else:
+                    merged.append(list(seg))
+            final_segs = [(round(x[0], 2), round(x[1], 2)) for x in merged]
+            total_mins = sum(x[1] - x[0] for x in final_segs) / 60.0
+            print(f"[+] Gemini AI Vision Selected {len(final_segs)} Complete Fight/Round Segments ({total_mins:.1f} mins)!")
+            return final_segs, short_windows
+
+    except Exception as e:
+        print(f"[!] Gemini Multimodal Video Clipper fallback triggered: {e}")
+
+    return get_audio_fallback_segments(video_path, game_key, total_duration)
 
 
 # ==============================================================================
@@ -386,10 +536,10 @@ def render_16x9_recap(source_vod: Path, segments: list[tuple[float, float]], out
     print(f"[+] Rendered 16:9 Full Match Recap: {output_path}")
 
 
-def generate_custom_thumbnail(source_vod: Path, peak_sec: float, game_key: str, headline: str, out_jpg: Path):
+def generate_custom_thumbnail(source_vod: Path, thumb_sec: float, game_key: str, headline: str, out_jpg: Path):
     raw_frame = (WORK_DIR / "thumb_raw.jpg").resolve()
     subprocess.run([
-        "ffmpeg", "-y", "-ss", str(peak_sec), "-i", str(source_vod.resolve()),
+        "ffmpeg", "-y", "-ss", str(thumb_sec), "-i", str(source_vod.resolve()),
         "-frames:v", "1", "-q:v", "2", str(raw_frame)
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -429,13 +579,13 @@ def format_ass_time(seconds: float) -> str:
     return f"{hrs}:{mins:02d}:{secs:05.2f}"
 
 
-def render_9x16_short(source_vod: Path, peak_sec: float, game_key: str, banner_title: str, whisper_model: WhisperModel, out_mp4: Path):
+def render_9x16_short(source_vod: Path, short_window: tuple[float, float], game_key: str, banner_title: str, whisper_model: WhisperModel, out_mp4: Path):
     """
-    Renders a 58s vertical Short starting 15s before the action spike and continuing
-    for 43s AFTER the spike so the round-winning kill/clutch never cuts off early.
+    Renders a vertical Short using the exact AI-verified (start_sec, end_sec) window
+    anchored to the end of the round/fight so it NEVER cuts mid-fight.
     """
-    clip_dur = 58.0
-    start_sec = max(10.0, peak_sec - 15.0)
+    start_sec, end_sec = short_window
+    clip_dur = round(min(58.5, max(30.0, end_sec - start_sec)), 2)
     raw_clip = (WORK_DIR / "short_raw.mp4").resolve()
     wav_clip = (WORK_DIR / "short_audio.wav").resolve()
     ass_file = (WORK_DIR / "subtitles.ass").resolve()
@@ -451,7 +601,6 @@ def render_9x16_short(source_vod: Path, peak_sec: float, game_key: str, banner_t
         "ffmpeg", "-y", "-i", str(raw_clip), "-vn", "-ac", "1", "-ar", "16000", str(wav_clip)
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-    # Transcribe word-by-word captions with faster-whisper
     segments_gen, _ = whisper_model.transcribe(str(wav_clip), word_timestamps=True)
     ass_header = """[Script Info]
 ScriptType: v4.00+
@@ -468,7 +617,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     clean_banner = re.sub(r"[^A-Za-z0-9 vsVS!\-&]", "", banner_title).strip()[:36]
     events = [
-        f"Dialogue: 0,0:00:00.00,0:00:58.00,TopBanner,,0,0,0,,{GAME_CONFIG[game_key]['name'].upper()}\\N{clean_banner}"
+        f"Dialogue: 0,0:00:00.00,{format_ass_time(clip_dur)},TopBanner,,0,0,0,,{GAME_CONFIG[game_key]['name'].upper()}\\N{clean_banner}"
     ]
 
     for seg in segments_gen:
@@ -491,7 +640,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     ass_file.write_text(ass_header + "\n".join(events) + "\n", encoding="utf-8")
 
-    # Strict Instagram/YouTube Reel encoding: yuv420p, 30fps, +faststart
     vf_complex = (
         "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5[bg];"
         "[0:v]scale=1080:-2:force_original_aspect_ratio=decrease[fg];"
@@ -506,11 +654,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2",
         str(out_mp4_abs)
     ], cwd=str(WORK_DIR.resolve()), check=True)
-    print(f"[+] Rendered 9:16 Subtitled Short (58s w/ 43s post-peak tail): {out_mp4_abs}")
+    print(f"[+] Rendered AI-Verified 9:16 Short ({start_sec}s -> {end_sec}s): {out_mp4_abs}")
 
 
 # ==============================================================================
-# 6. MINIMAL-TOKEN GEMINI AI SEO METADATA GENERATOR
+# 6. GEMINI AI SEO METADATA GENERATOR
 # ==============================================================================
 def generate_seo_metadata(vod_title: str, game_key: str) -> dict:
     game_info = GAME_CONFIG[game_key]
@@ -550,7 +698,7 @@ def generate_seo_metadata(vod_title: str, game_key: str) -> dict:
         parsed = json.loads(raw_text)
         return {**fallback_data, **parsed}
     except Exception as e:
-        print(f"[!] Gemini fallback used: {e}")
+        print(f"[!] Gemini SEO fallback used: {e}")
         return fallback_data
 
 
@@ -717,10 +865,6 @@ def upload_to_facebook_reels(video_path: Path, caption: str):
 
 
 def stage_video_for_instagram(video_path: Path, idx: int) -> str | None:
-    """
-    Stages the MP4 directly via GitHub's own raw CDN (raw.githubusercontent.com)
-    with fallback to 0x0.st / catbox so Meta's servers NEVER get blocked.
-    """
     repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
     branch = os.environ.get("GITHUB_REF_NAME", "main").strip()
 
@@ -735,13 +879,12 @@ def stage_video_for_instagram(video_path: Path, idx: int) -> str | None:
             subprocess.run(["git", "push", "origin", f"HEAD:{branch}"], check=True)
 
             raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/ig_stage/{stage_filename}"
-            time.sleep(5)  # Give GitHub CDN 5 seconds to propagate
+            time.sleep(5)
             print(f"[+] Staged MP4 on GitHub Raw CDN: {raw_url}")
             return raw_url
         except Exception as e:
             print(f"[!] GitHub Raw staging fallback triggered: {e}")
 
-    # Fallback 1: Catbox permanent raw upload
     try:
         with open(video_path.resolve(), "rb") as f:
             res = requests.post(
@@ -819,23 +962,24 @@ def main():
     game_key = select_target_game()
     shorts_count = int(os.environ.get("SHORTS_COUNT", "2"))
 
-    # 1. Discover & Download Tournament VOD
+    # 1. Discover & Download Tournament VOD (Slices 42-min match window if VOD is an 8-hour stream!)
     vod_path, info = find_and_download_vod(game_key)
     vod_id = info.get("id", "custom_vod")
     vod_title = info.get("title", f"{GAME_CONFIG[game_key]['name']} Pro Tournament Match")
-    print(f"[+] Downloaded VOD: {vod_title} ({vod_id})")
+    print(f"[+] Downloaded Match Video: {vod_title} ({vod_id})")
 
-    # 2. Extract Smart Highlights (Full 60s Tactical Rounds or 95s BR Fights + 5.5m Final Circle)
-    segments, top_peaks = get_smart_highlight_segments(vod_path, game_key)
+    # 2. Extract AI-Verified Highlights (Gemini watches HUD/Round-End banners so fights NEVER cut early)
+    segments, short_windows = get_ai_highlight_segments(vod_path, game_key)
 
-    # 3. Generate Minimal-Token Gemini SEO Metadata
+    # 3. Generate Gemini SEO Metadata
     seo = generate_seo_metadata(vod_title, game_key)
 
     # 4. Render 16:9 Full Recap & Custom Thumbnail
     recap_mp4 = (WORK_DIR / "final_recap_16x9.mp4").resolve()
     thumb_jpg = (WORK_DIR / "custom_thumb.jpg").resolve()
     render_16x9_recap(vod_path, segments, recap_mp4)
-    generate_custom_thumbnail(vod_path, top_peaks[0], game_key, seo["match_headline"], thumb_jpg)
+    thumb_timestamp = (short_windows[0][0] + short_windows[0][1]) / 2.0 if short_windows else 60.0
+    generate_custom_thumbnail(vod_path, thumb_timestamp, game_key, seo["match_headline"], thumb_jpg)
 
     # 5. Upload 16:9 Recap to YouTube + Auto-Sort into Game Playlist + Share on Facebook Page
     youtube = get_youtube_client()
@@ -855,9 +999,9 @@ def main():
     print("[*] Loading faster-whisper model for word-by-word Short subtitles...")
     whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
 
-    for idx, peak in enumerate(top_peaks[:shorts_count]):
+    for idx, s_window in enumerate(short_windows[:shorts_count]):
         short_mp4 = (WORK_DIR / f"short_{idx+1}.mp4").resolve()
-        render_9x16_short(vod_path, peak, game_key, seo["match_headline"], whisper_model, short_mp4)
+        render_9x16_short(vod_path, s_window, game_key, seo["match_headline"], whisper_model, short_mp4)
 
         short_title = f"{seo['match_headline']} - Insane {GAME_CONFIG[game_key]['name']} Highlight #{idx+1} #Shorts"
         short_caption = seo["short_caption"]
@@ -873,7 +1017,7 @@ def main():
         )
         # B. Facebook Reel
         upload_to_facebook_reels(short_mp4, short_caption)
-        # C. Instagram Reel (Staged via GitHub Raw CDN + Polled until FINISHED)
+        # C. Instagram Reel
         upload_to_instagram_reels(short_mp4, short_caption, idx + 1)
 
     # 7. Record VOD ID & Clean Up
