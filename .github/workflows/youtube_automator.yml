@@ -36,7 +36,7 @@ permissions:
 jobs:
   clip_and_publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 360
 
     steps:
       - name: Checkout Repository
@@ -101,6 +101,7 @@ jobs:
 
       - name: Run Multi-Platform Esports Pipeline
         env:
+          PYTHONUNBUFFERED: '1'
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
           TARGET_GAME: ${{ github.event.inputs.game || 'auto' }}
