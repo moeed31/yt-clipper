@@ -22,7 +22,7 @@ from faster_whisper import WhisperModel
 sys.stdout.reconfigure(line_buffering=True)
 
 # ==============================================================================
-# 1. 9-GAME CONFIGURATION
+# 1. 9-GAME CONFIGURATION (EXPANDED MULTI-QUERY SEARCH POOL)
 # ==============================================================================
 GAME_CONFIG = {
     "valorant": {
@@ -31,7 +31,9 @@ GAME_CONFIG = {
         "accent_color": (255, 70, 85),
         "queries": [
             "Valorant Champions Tour VCT full match map VOD",
-            "VCT Americas EMEA Pacific Grand Final full match"
+            "VCT Americas EMEA Pacific Grand Final full match",
+            "Valorant Masters Champions full map gameplay",
+            "VCT Playoffs full match highlight VOD"
         ],
         "playlist_title": "VALORANT Tournament Highlights & Full Recaps",
         "hashtags": "#Valorant #VCT #ValorantClips #ValorantEsports #Gaming"
@@ -42,7 +44,9 @@ GAME_CONFIG = {
         "accent_color": (220, 38, 38),
         "queries": [
             "ALGS Apex Legends Global Series Finals full match VOD",
-            "ALGS Pro League Match Point Finals full game"
+            "ALGS Pro League Match Point Finals full game",
+            "Apex Legends ALGS Championship full match gameplay",
+            "ALGS Split Playoffs Finals full game VOD"
         ],
         "playlist_title": "Apex Legends ALGS Final Circles & Best Fights",
         "hashtags": "#ApexLegends #ALGS #ApexClips #BattleRoyale #Esports"
@@ -53,7 +57,9 @@ GAME_CONFIG = {
         "accent_color": (245, 158, 11),
         "queries": [
             "CS2 ESL Pro League BLAST Premier full match map VOD",
-            "CS2 Major Playoffs full match highlight VOD"
+            "CS2 Major Playoffs full match highlight VOD",
+            "IEM Katowice Cologne CS2 full map match",
+            "CS2 Premier tournament full game VOD"
         ],
         "playlist_title": "CS2 Pro Match Recaps & Highlights",
         "hashtags": "#CS2 #CounterStrike2 #CS2Clips #ESL #Esports"
@@ -64,7 +70,9 @@ GAME_CONFIG = {
         "accent_color": (234, 179, 8),
         "queries": [
             "PUBG Global Series PGS PGC Grand Finals full match VOD",
-            "PUBG Esports Tournament Grand Final Match VOD"
+            "PUBG Esports Tournament Grand Final Match VOD",
+            "PUBG Nations Cup Global Championship full match",
+            "PUBG PGS Finals full game esports"
         ],
         "playlist_title": "PUBG Tournament Final Circles & Recaps",
         "hashtags": "#PUBG #PUBGEsports #BattleRoyale #PUBGClips #Gaming"
@@ -75,7 +83,9 @@ GAME_CONFIG = {
         "accent_color": (56, 189, 248),
         "queries": [
             "FNCS Fortnite Championship Series Grand Finals full game VOD",
-            "Fortnite FNCS Major Finals full match"
+            "Fortnite FNCS Major Finals full match",
+            "FNCS Global Championship full game highlights",
+            "Fortnite competitive tournament finals full match"
         ],
         "playlist_title": "Fortnite FNCS Endgames & Best Fights",
         "hashtags": "#Fortnite #FNCS #FortniteClips #FortniteCompetitive #Gaming"
@@ -85,8 +95,10 @@ GAME_CONFIG = {
         "type": "tactical",
         "accent_color": (59, 130, 246),
         "queries": [
-            "Rainbow Six Siege Six Invitational Pro League full match VOD",
-            "R6 Esports Major Playoffs full map VOD"
+            "Rainbow Six Siege Six Invitational full match",
+            "R6 Esports Major Playoffs full map VOD",
+            "Rainbow Six Siege Pro League full game",
+            "BLAST R6 Major full match gameplay"
         ],
         "playlist_title": "Rainbow Six Siege Pro Recaps",
         "hashtags": "#R6Siege #RainbowSixSiege #R6Esports #FPS #Gaming"
@@ -96,8 +108,10 @@ GAME_CONFIG = {
         "type": "tactical",
         "accent_color": (34, 197, 94),
         "queries": [
-            "Call of Duty League CDL Major Finals full match VOD",
-            "CDL Championship Weekend full series match"
+            "Call of Duty League CDL Major full match",
+            "CDL Championship Weekend full series match",
+            "Call of Duty League OpTic FaZe Ultra Thieves full match",
+            "CDL Major Finals full game VOD"
         ],
         "playlist_title": "Call of Duty League Match Recaps",
         "hashtags": "#CallOfDuty #CDL #CODLeague #CODClips #Esports"
@@ -108,7 +122,9 @@ GAME_CONFIG = {
         "accent_color": (168, 85, 247),
         "queries": [
             "Tekken 8 World Tour TWT Top 8 Grand Finals full set",
-            "EVO Tekken 8 Finals full match set"
+            "EVO Tekken 8 Finals full match set",
+            "Tekken 8 Arslan Ash Knee LowHigh tournament full set",
+            "Tekken 8 Major Top 8 full match"
         ],
         "playlist_title": "Tekken 8 Tournament Sets & Highlights",
         "hashtags": "#Tekken8 #TWT #FightingGames #FGC #Esports"
@@ -119,7 +135,9 @@ GAME_CONFIG = {
         "accent_color": (14, 165, 233),
         "queries": [
             "LCK LEC Worlds League of Legends full game match VOD",
-            "LoL Esports MSI Worlds Playoffs full match"
+            "LoL Esports MSI Worlds Playoffs full match",
+            "T1 GenG G2 Fnatic full game highlight VOD",
+            "League of Legends Worlds Finals full game"
         ],
         "playlist_title": "League of Legends Pro Match Recaps",
         "hashtags": "#LeagueOfLegends #LoLEsports #LCK #Worlds #Gaming"
@@ -163,10 +181,6 @@ def select_target_game() -> str:
 
 
 def resolve_working_gemini_model(client: genai.Client) -> str:
-    """
-    Dynamically checks which Gemini Flash model is active on your API key
-    so deprecated model names NEVER cause a 404 NOT_FOUND error.
-    """
     candidates = [
         "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
@@ -189,7 +203,7 @@ def resolve_working_gemini_model(client: genai.Client) -> str:
 
 
 # ==============================================================================
-# 3. FAST & SAFE YOUTUBE VOD DOWNLOADER (WITH HARD TIMEOUTS)
+# 3. MULTI-QUERY YOUTUBE VOD DISCOVERY & AUTO-ROTATING DOWNLOADER
 # ==============================================================================
 def get_ytdlp_base_args() -> list[str]:
     args = [
@@ -206,70 +220,122 @@ def get_ytdlp_base_args() -> list[str]:
     return args
 
 
-def find_and_download_vod(game_key: str) -> tuple[Path, dict]:
-    custom_url = os.environ.get("CUSTOM_VOD_URL", "").strip()
-    processed_ids = load_processed_vods()
+def search_candidates_for_game(game_key: str, processed_ids: set) -> list[tuple[str, int]]:
+    """
+    Searches across ALL queries for a game (up to 30 results per query) and accepts
+    VODs from 12 minutes (720s) up to 3 hours (10800s) so R6, COD, and Tekken never fail!
+    """
     game_info = GAME_CONFIG[game_key]
-    output_template = str((WORK_DIR / "source_vod.%(ext)s").resolve())
-
+    queries = list(game_info["queries"])
+    random.shuffle(queries)
     candidates = []
-    if custom_url:
-        candidates.append(custom_url)
-    else:
-        query = random.choice(game_info["queries"])
+    seen = set()
+
+    for query in queries:
         print(f"[*] Searching YouTube for {game_info['name']} VODs: '{query}'", flush=True)
-        search_cmd = get_ytdlp_base_args() + ["--dump-json", "--flat-playlist", f"ytsearch15:{query}"]
-        res = subprocess.run(search_cmd, capture_output=True, text=True, timeout=90)
+        search_cmd = get_ytdlp_base_args() + ["--dump-json", "--flat-playlist", f"ytsearch30:{query}"]
+        try:
+            res = subprocess.run(search_cmd, capture_output=True, text=True, timeout=90)
+        except Exception as e:
+            print(f"[!] Search query timeout/error: {e}", flush=True)
+            continue
+
         for line in res.stdout.splitlines():
             try:
                 data = json.loads(line)
                 vid_id = data.get("id")
-                duration = data.get("duration") or 0
-                # Pick single-match VODs between 18 mins and 65 mins so downloads take < 90 seconds
-                if vid_id and vid_id not in processed_ids and 1080 <= duration <= 3900:
-                    candidates.append(f"https://www.youtube.com/watch?v={vid_id}")
+                duration = int(data.get("duration") or 0)
+                live_status = data.get("live_status") or ""
+                if not vid_id or vid_id in processed_ids or vid_id in seen:
+                    continue
+                if live_status in ("is_live", "is_upcoming"):
+                    continue
+                # Accept 12 mins (720s) to 3 hours (10800s)
+                if 720 <= duration <= 10800:
+                    seen.add(vid_id)
+                    candidates.append((f"https://www.youtube.com/watch?v={vid_id}", duration))
             except Exception:
                 continue
 
-    if not candidates:
-        raise RuntimeError(f"No suitable unprocessed VODs found for {game_info['name']}.")
+        # As soon as we have at least 5 strong candidates, stop searching more queries
+        if len(candidates) >= 5:
+            break
 
-    for url in candidates[:3]:
-        print(f"[*] Downloading VOD (max 10-min timeout): {url}", flush=True)
-        dl_cmd = get_ytdlp_base_args() + [
-            "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best",
-            "--merge-output-format", "mp4",
-            "--concurrent-fragments", "8",
-            "--write-info-json",
-            "-o", output_template,
-            url
-        ]
-        try:
-            proc = subprocess.run(dl_cmd, timeout=600)
-        except subprocess.TimeoutExpired:
-            print(f"[!] Download timed out for {url}, trying next candidate...", flush=True)
+    # Prefer single-map / single-set VODs (15–55 mins) first for fastest download speed
+    candidates.sort(key=lambda x: 0 if 900 <= x[1] <= 3300 else 1)
+    return candidates
+
+
+def find_and_download_vod(initial_game_key: str) -> tuple[Path, dict, str]:
+    custom_url = os.environ.get("CUSTOM_VOD_URL", "").strip()
+    processed_ids = load_processed_vods()
+    output_template = str((WORK_DIR / "source_vod.%(ext)s").resolve())
+
+    # Build rotation order starting with initial_game_key so if one game has 0 results, it tries the next
+    all_keys = list(GAME_CONFIG.keys())
+    start_idx = all_keys.index(initial_game_key) if initial_game_key in all_keys else 0
+    ordered_games = all_keys[start_idx:] + all_keys[:start_idx]
+
+    for game_key in ordered_games:
+        game_info = GAME_CONFIG[game_key]
+        if custom_url:
+            candidates = [(custom_url, 2400)]
+        else:
+            candidates = search_candidates_for_game(game_key, processed_ids)
+
+        if not candidates:
+            print(f"[!] No suitable VODs found for {game_info['name']}, rotating to next game...", flush=True)
             continue
 
-        mp4_path = (WORK_DIR / "source_vod.mp4").resolve()
-        info_path = (WORK_DIR / "source_vod.info.json").resolve()
-        if proc.returncode == 0 and mp4_path.exists():
-            info_data = {}
-            if info_path.exists():
-                info_data = json.loads(info_path.read_text(encoding="utf-8", errors="ignore"))
-            print(f"[+] Download & merge complete: {mp4_path.name} ({mp4_path.stat().st_size / (1024*1024):.1f} MB)", flush=True)
-            return mp4_path, info_data
+        print(f"[+] Found {len(candidates)} candidate VODs for {game_info['name']}!", flush=True)
 
-    raise RuntimeError("All VOD download attempts failed.")
+        for url, dur in candidates[:4]:
+            print(f"[*] Downloading VOD ({dur//60} mins): {url}", flush=True)
+            dl_cmd = get_ytdlp_base_args() + [
+                "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best",
+                "--merge-output-format", "mp4",
+                "--concurrent-fragments", "8",
+                "--write-info-json",
+                "-o", output_template,
+                url
+            ]
+            try:
+                proc = subprocess.run(dl_cmd, timeout=600)
+            except subprocess.TimeoutExpired:
+                print(f"[!] Download timed out for {url}, trying next candidate...", flush=True)
+                continue
+
+            mp4_path = (WORK_DIR / "source_vod.mp4").resolve()
+            info_path = (WORK_DIR / "source_vod.info.json").resolve()
+            if proc.returncode == 0 and mp4_path.exists():
+                info_data = {}
+                if info_path.exists():
+                    info_data = json.loads(info_path.read_text(encoding="utf-8", errors="ignore"))
+
+                # If the downloaded VOD is longer than 50 minutes (e.g. a 2-hour BO5 series),
+                # fast-trim the active 45-minute match block locally with stream copy (-c copy) in 3 seconds!
+                actual_dur = int(info_data.get("duration") or dur or 0)
+                if actual_dur > 3000:
+                    trimmed_mp4 = (WORK_DIR / "source_vod_trimmed.mp4").resolve()
+                    offset_s = min(300, int(actual_dur * 0.05))
+                    print(f"[*] VOD is {actual_dur//60}m long; fast-slicing 45-minute prime match window locally...", flush=True)
+                    subprocess.run([
+                        "ffmpeg", "-y", "-ss", str(offset_s), "-t", "2700",
+                        "-i", str(mp4_path), "-c", "copy", str(trimmed_mp4)
+                    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
+                    mp4_path.unlink(missing_ok=True)
+                    trimmed_mp4.rename(mp4_path)
+
+                print(f"[+] Download & preparation complete: {mp4_path.name} ({mp4_path.stat().st_size / (1024*1024):.1f} MB)", flush=True)
+                return mp4_path, info_data, game_key
+
+    raise RuntimeError("All VOD download attempts across games failed.")
 
 
 # ==============================================================================
 # 4. HANG-PROOF HIGHLIGHT ENGINE (2-CHUNK GEMINI VISION + DISK-BASED FALLBACK)
 # ==============================================================================
 def get_audio_fallback_segments(video_path: Path, game_key: str, total_duration: float) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
-    """
-    Uses a temporary disk file instead of subprocess.PIPE so FFmpeg NEVER deadlocks!
-    Walks forward after each audio peak until the round/fight naturally ends.
-    """
     print("[*] Running silence-aware audio highlight analysis (disk-buffered)...", flush=True)
     game_type = GAME_CONFIG[game_key]["type"]
     pcm_file = (WORK_DIR / "audio_energy.pcm").resolve()
@@ -417,8 +483,7 @@ def get_ai_highlight_segments(video_path: Path, game_key: str) -> tuple[list[tup
             print(f"[*] Uploading {label} ({proxy_chunk.stat().st_size / (1024*1024):.1f} MB) to Gemini Files API...", flush=True)
             uploaded_file = client.files.upload(file=str(proxy_chunk))
 
-            # Poll up to 3 minutes max so it NEVER hangs forever
-            for poll_i in range(36):
+            for _ in range(36):
                 if uploaded_file.state.name != "PROCESSING":
                     break
                 time.sleep(5)
@@ -586,7 +651,6 @@ def generate_custom_thumbnail(source_vod: Path, thumb_sec: float, game_key: str,
     draw.text((45, 535), headline.upper()[:34], font=font_main, fill=(255, 255, 255, 255))
     draw.text((45, 615), GAME_CONFIG[game_key]["name"].upper(), font=font_main, fill=accent + (255,))
 
-    # Convert RGBA composite to RGB before saving as JPEG
     combined = Image.alpha_composite(img, overlay).convert("RGB")
     combined.save(out_jpg.resolve(), "JPEG", quality=92)
     print(f"[+] Generated Custom Thumbnail: {out_jpg.name}", flush=True)
@@ -965,11 +1029,11 @@ def upload_to_instagram_reels(video_path: Path, caption: str, idx: int):
 # 8. MAIN EXECUTION PIPELINE
 # ==============================================================================
 def main():
-    game_key = select_target_game()
+    initial_game_key = select_target_game()
     shorts_count = int(os.environ.get("SHORTS_COUNT", "2"))
 
-    # 1. Discover & Download Tournament VOD
-    vod_path, info = find_and_download_vod(game_key)
+    # 1. Discover & Download Tournament VOD (Auto-rotates if a game has 0 matches)
+    vod_path, info, game_key = find_and_download_vod(initial_game_key)
     vod_id = info.get("id", "custom_vod")
     vod_title = info.get("title", f"{GAME_CONFIG[game_key]['name']} Pro Tournament Match")
     print(f"[+] Downloaded Match Video: {vod_title} ({vod_id})", flush=True)
