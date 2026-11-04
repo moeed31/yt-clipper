@@ -90,7 +90,6 @@ def fetch_weekly_top_clips() -> list[dict]:
                 views = int(node.get("viewCount") or 0)
                 streamer = (node.get("broadcaster") or {}).get("displayName") or "Twitch"
 
-                # Lowered minimum duration check to 10s and max to 60s for broader clip matching
                 if slug and slug not in seen_ids and 10.0 <= dur <= 60.0:
                     seen_ids.add(slug)
                     candidates.append({
@@ -106,7 +105,7 @@ def fetch_weekly_top_clips() -> list[dict]:
             continue
 
     candidates.sort(key=lambda x: x["views"], reverse=True)
-    return candidates[:6] # Top 6 clips is ideal for a fast weekly compilation
+    return candidates[:6]
 
 
 def download_clip_16x9(clip: dict, index: int) -> Path | None:
@@ -125,16 +124,17 @@ def download_clip_16x9(clip: dict, index: int) -> Path | None:
 
         formatted_mp4 = (WORK_DIR / f"formatted_clip_{index}.mp4").resolve()
         vf = (
-            "[0:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,boxblur=30:10[bg];"
+            "[0:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,boxblur=20:5[bg];"
             "[0:v]scale=1920:1080:force_original_aspect_ratio=decrease[fg];"
             "[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[vout]"
         )
+        # Increased timeout to 300 seconds so FFmpeg never times out
         subprocess.run([
             "ffmpeg", "-y", "-i", str(raw_mp4), "-filter_complex", vf,
             "-map", "[vout]", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast",
-            "-crf", "21", "-r", "30", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
+            "-crf", "22", "-r", "30", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
             str(formatted_mp4)
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120, check=True)
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300, check=True)
         return formatted_mp4
     except Exception as e:
         print(f"[!] Error preparing compilation clip {index}: {e}", flush=True)
@@ -178,7 +178,6 @@ def main():
     print("[*] Fetching top Twitch clips for weekly compilation...", flush=True)
     clips = fetch_weekly_top_clips()
     
-    # Lowered threshold from 4 to 3 clips so it compiles successfully right away
     if len(clips) < 3:
         print("[!] Not enough new clips found for a weekly compilation yet.", flush=True)
         return
