@@ -38,23 +38,25 @@ def mark_clip_processed(clip_id: str):
 
 
 def fetch_trending_twitch_clips(processed: set, limit: int = 2) -> list[dict]:
-    """
-    Queries Twitch's public GQL endpoint to find what games/categories are currently trending,
-    then pulls top-viewed clips across those categories and picks unique channels.
-    """
     headers = {
         "Client-ID": "kimne78kx3ncx6brgo4mv6wki5h1ko",
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0"
     }
 
-    # 1. Fetch currently trending games on Twitch
+    # Robust Fallback List of All Top Gaming Categories on Twitch
+    trending_games = [
+        "VALORANT", "Grand Theft Auto V", "Fortnite", "League of Legends",
+        "Counter-Strike", "Apex Legends", "Minecraft", "Call of Duty: Warzone",
+        "Dota 2", "Rocket League", "Tekken 8", "Street Fighter 6"
+    ]
+
+    # Attempt to fetch live trending directories dynamically
     trending_query = """
     {
-      directories(first: 10, sort: VIEWS_DESC) {
+      directories(first: 12, sort: VIEWS_DESC) {
         edges {
           node {
-            id
             name
           }
         }
@@ -62,19 +64,20 @@ def fetch_trending_twitch_clips(processed: set, limit: int = 2) -> list[dict]:
     }
     """
     try:
-        r = requests.post("https://gql.twitch.tv/gql", headers=headers, json={"query": trending_query}, timeout=20)
+        r = requests.post("https://gql.twitch.tv/gql", headers=headers, json={"query": trending_query}, timeout=15)
         edges = (((r.json().get("data") or {}).get("directories") or {}).get("edges")) or []
-        trending_games = [node.get("node", {}).get("name") for node in edges if node.get("node", {}).get("name")]
+        live_games = [node.get("node", {}).get("name") for node in edges if node.get("node", {}).get("name")]
+        if live_games:
+            # Combine live trending with fallback to guarantee coverage
+            trending_games = live_games + [g for g in trending_games if g not in live_games]
     except Exception as e:
-        print(f"[!] Failed to fetch trending directories: {e}", flush=True)
-        trending_games = ["VALORANT", "Grand Theft Auto V", "Fortnite", "League of Legends", "Counter-Strike"]
+        print(f"[!] Using default gaming categories due to query timeout: {e}", flush=True)
 
-    print(f"[+] Trending Twitch Games detected: {', '.join(trending_games[:5])}", flush=True)
+    print(f"[+] Scanning Twitch categories: {', '.join(trending_games[:6])}...", flush=True)
 
     collected_clips = []
     seen_channels = set()
 
-    # 2. Pull top clips across trending categories until we get 2 unique clips from different channels
     for game_name in trending_games:
         if len(collected_clips) >= limit:
             break
@@ -100,10 +103,9 @@ def fetch_trending_twitch_clips(processed: set, limit: int = 2) -> list[dict]:
         }}
         """
         try:
-            r = requests.post("https://gql.twitch.tv/gql", headers=headers, json={"query": inline_query}, timeout=25)
+            r = requests.post("https://gql.twitch.tv/gql", headers=headers, json={"query": inline_query}, timeout=20)
             edges = (((r.json().get("data") or {}).get("game") or {}).get("clips") or {}).get("edges") or []
             
-            # Sort clips by view count descending
             game_clips = []
             for edge in edges:
                 node = edge.get("node") or {}
@@ -130,9 +132,9 @@ def fetch_trending_twitch_clips(processed: set, limit: int = 2) -> list[dict]:
                 if ch not in seen_channels:
                     seen_channels.add(ch)
                     collected_clips.append(clip)
-                    break # Move to next trending game to ensure distinct channel variety
-        except Exception as e:
-            print(f"[!] Warning fetching clips for {game_name}: {e}", flush=True)
+                    break
+        except Exception:
+            continue
 
     return collected_clips[:limit]
 
@@ -315,13 +317,12 @@ def main():
         yt_title = f"{clip_meta['title'][:50]} | @{clip_meta['streamer']} ({clip_meta['game']}) #Shorts"
         caption = f"🔥 {clip_meta['title']} (@{clip_meta['streamer']} on Twitch)\n👁️ {clip_meta['views']:,} views!\n\n#Twitch #Gaming #Clips #Shorts #TheRippersGaming"
 
-        # Post both clips at the same time across platforms
         upload_youtube_short(final_short, yt_title, caption)
         upload_to_facebook_reels(final_short, caption)
         upload_to_instagram_reels(final_short, caption, i)
 
         mark_clip_processed(clip_meta["id"])
-        time.sleep(15) # Brief cooldown between the two simultaneous channel uploads
+        time.sleep(15)
 
     shutil.rmtree(WORK_DIR, ignore_errors=True)
     shutil.rmtree(IG_STAGE_DIR, ignore_errors=True)
