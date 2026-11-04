@@ -1,0 +1,80 @@
+name: Daily #1 Most-Watched Twitch Gaming Clip
+
+on:
+  schedule:
+    - cron: '0 15 * * *' # Runs once daily at 15:00 UTC (8:00 PM PKT Prime Time)
+  workflow_dispatch:
+    inputs:
+      game:
+        description: 'Select Game (or auto to rotate daily)'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - valorant
+          - apex
+          - cs2
+          - pubg
+          - fortnite
+          - r6
+          - cod
+          - tekken
+          - lol
+
+permissions:
+  contents: write
+
+jobs:
+  publish_daily_twitch_clip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install FFmpeg & Fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-liberation fonts-dejavu-core
+
+      - name: Configure Git for Instagram Staging & State Tracking
+        run: |
+          git config --local user.email "actions@github.com"
+          git config --local user.name "Esports Automator Bot"
+
+      - name: Install Python Packages
+        run: |
+          pip install --upgrade pip
+          pip install "yt-dlp[default,curl-cffi]" faster-whisper requests google-genai
+          pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
+
+      - name: Run Daily Twitch Clip Pipeline
+        env:
+          PYTHONUNBUFFERED: '1'
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          TARGET_GAME: ${{ github.event.inputs.game || 'auto' }}
+          TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
+          TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+        run: |
+          python3 twitch_daily_clip.py
+
+      - name: Clean Up Temporary IG Files & Commit Processed Twitch Clips
+        if: always()
+        run: |
+          rm -rf ig_stage/
+          git add -A ig_stage/ processed_twitch_clips.txt 2>/dev/null || true
+          git diff --staged --quiet || (git commit -m "chore: update processed twitch clips [skip ci]" && git push)
