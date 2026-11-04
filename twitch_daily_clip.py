@@ -44,14 +44,12 @@ def fetch_trending_twitch_clips(processed: set, limit: int = 2) -> list[dict]:
         "User-Agent": "Mozilla/5.0"
     }
 
-    # Robust Fallback List of All Top Gaming Categories on Twitch
     trending_games = [
         "VALORANT", "Grand Theft Auto V", "Fortnite", "League of Legends",
         "Counter-Strike", "Apex Legends", "Minecraft", "Call of Duty: Warzone",
         "Dota 2", "Rocket League", "Tekken 8", "Street Fighter 6"
     ]
 
-    # Attempt to fetch live trending directories dynamically
     trending_query = """
     {
       directories(first: 12, sort: VIEWS_DESC) {
@@ -68,7 +66,6 @@ def fetch_trending_twitch_clips(processed: set, limit: int = 2) -> list[dict]:
         edges = (((r.json().get("data") or {}).get("directories") or {}).get("edges")) or []
         live_games = [node.get("node", {}).get("name") for node in edges if node.get("node", {}).get("name")]
         if live_games:
-            # Combine live trending with fallback to guarantee coverage
             trending_games = live_games + [g for g in trending_games if g not in live_games]
     except Exception as e:
         print(f"[!] Using default gaming categories due to query timeout: {e}", flush=True)
@@ -167,8 +164,8 @@ def render_vertical_short(raw_mp4: Path, clip_meta: dict, out_mp4: Path, whisper
     probe_cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(raw_mp4.resolve())]
     clip_dur = min(58.0, float(subprocess.check_output(probe_cmd, timeout=20).decode().strip()))
 
-    wav_clip = (WORK_DIR / f"audio_{clip_meta['id']}.wav").resolve()
-    ass_file = (WORK_DIR / f"subtitles_{clip_meta['id']}.ass").resolve()
+    wav_clip = (WORK_DIR / "clip_audio.wav").resolve()
+    ass_file = (WORK_DIR / "subtitles.ass").resolve()
 
     subprocess.run(["ffmpeg", "-y", "-i", str(raw_mp4.resolve()), "-t", str(clip_dur), "-vn", "-ac", "1", "-ar", "16000", str(wav_clip)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=True)
 
