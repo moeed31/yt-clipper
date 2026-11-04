@@ -4,6 +4,7 @@
 
 [![GitHub Actions Status](https://img.shields.io/github/actions/workflow/status/moeed31/yt-clipper/youtube_automator.yml?branch=main&style=flat-square&logo=github-actions&logoColor=white&label=Tournament%20Pipeline)](https://github.com/moeed31/yt-clipper/actions)
 [![Twitch Clips Pipeline](https://img.shields.io/github/actions/workflow/status/moeed31/yt-clipper/twitch_daily.yml?branch=main&style=flat-square&logo=twitch&logoColor=white&label=Twitch%20Automator)](https://github.com/moeed31/yt-clipper/actions)
+[![Weekly Compilation Pipeline](https://img.shields.io/github/actions/workflow/status/moeed31/yt-clipper/twitch_weekly.yml?branch=main&style=flat-square&logo=youtube&logoColor=white&label=Weekly%20Compilation)](https://github.com/moeed31/yt-clipper/actions)
 [![Python Version](https://img.shields.io/badge/Python-3.11%2B-blue?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 
@@ -20,7 +21,7 @@ An end-to-end, fully automated headless pipeline designed to scrape, clip, rende
 * **📼 Weekly Compilation Engine:** Automatically aggregates the top-performing weekly Twitch clips, formats them into a widescreen 16:9 master compilation with custom thumbnails, and publishes them to YouTube.
 * **🧠 Gemini AI Vision & SEO Engine:** Leverages Google Gemini models to intelligently detect high-impact match moments, full rounds, or final circles, while auto-generating high-CTR titles, descriptions, and viral short captions.
 * **🎨 Dynamic Video Processing:** Automatically handles 16:9 widescreen full match recaps with custom generated branded thumbnails, and 9:16 vertical short-form content with custom top banners and blur-fill padding.
-* **🔄 Zero-Server Infrastructure:** Runs entirely on **GitHub Actions** using cron schedules and workflow dispatches with automated state persistence (`processed_vods.txt`, `processed_twitch_clips.txt`).
+* **🔄 Zero-Server Infrastructure:** Runs entirely on **GitHub Actions** using cron schedules and workflow dispatches with automated state persistence (`processed_vods.txt`, `processed_twitch_clips.txt`, `processed_compilation_clips.txt`).
 
 ---
 
@@ -53,15 +54,19 @@ An end-to-end, fully automated headless pipeline designed to scrape, clip, rende
 ## 🛠️ Installation & Setup
 
 ### 1. Clone the Repository
+
 ```bash
 git clone [https://github.com/moeed31/yt-clipper.git](https://github.com/moeed31/yt-clipper.git)
 cd yt-clipper
+```
+
 ### 2. Configure GitHub Secrets
-To allow the workflows to authenticate with your social channels and AI providers, add the following secrets in your repository settings (**Settings $\rightarrow$ Secrets and variables $\rightarrow$ Actions**):
+
+To allow the workflows to authenticate with your social channels and AI providers, add the following secrets in your repository settings (**Settings -> Secrets and variables -> Actions**):
 
 | Secret Name | Description |
 | :--- | :--- |
-| `GEMINI_API_KEY` | Google Gemini API Key from [AI Studio](https://aistudio.google.com/apikey) |
+| `GEMINI_API_KEY` | Google Gemini API Key from AI Studio |
 | `YT_CLIENT_ID` | Google Cloud Console OAuth Client ID |
 | `YT_CLIENT_SECRET` | Google Cloud Console OAuth Client Secret |
 | `YT_REFRESH_TOKEN` | Permanent Google OAuth Refresh Token with YouTube scope |
@@ -69,3 +74,28 @@ To allow the workflows to authenticate with your social channels and AI provider
 | `FB_PAGE_ACCESS_TOKEN` | Facebook Long-Lived Page Access Token |
 | `IG_USER_ID` | Instagram Business Account ID linked to your FB Page |
 | `YT_COOKIES` *(Optional)* | Netscape-formatted `cookies.txt` content for robust YouTube authentication |
+
+---
+
+## ⏰ Workflow Automation Schedules
+
+| Workflow File | Schedule (UTC) | Local Prime-Time (PKT) | Purpose |
+| :--- | :--- | :--- | :--- |
+| `youtube_automator.yml` | Every 6 hours (`0 */6 * * *`) | Every 6 hours | Scrapes tournament VODs, builds playlists, posts recaps & shorts. |
+| `twitch_daily.yml` | Twice daily (`0 11,17 * * *`) | 4:00 PM & 10:00 PM | Fetches top 2 unique trending Twitch clips and multi-posts. |
+| `twitch_weekly.yml` | Every Sunday (`0 12 * * SUN`) | Sunday 5:00 PM | Stitches weekly top clips into a 16:9 compilation video. |
+
+---
+
+## 🕹️ Manual Triggers
+
+All pipelines support **Workflow Dispatch**. You can trigger any workflow manually from the **Actions** tab on GitHub:
+* **Tournament Pipeline:** Choose between specific games (`valorant`, `cs2`, etc.), run in `auto` rotation, provide an optional custom VOD URL, or set custom short counts.
+* **Twitch Automator:** Runs on demand to pull and publish the latest trending clips across live categories.
+* **Weekly Compilation:** Runs on demand to stitch and publish a fresh widescreen compilation.
+
+---
+
+## 📄 License
+
+Distributed under the [MIT License](LICENSE). Feel free to fork, adapt, and build your own automated media pipelines.
