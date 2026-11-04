@@ -56,3 +56,16 @@ An end-to-end, fully automated headless pipeline designed to scrape, clip, rende
 ```bash
 git clone [https://github.com/moeed31/yt-clipper.git](https://github.com/moeed31/yt-clipper.git)
 cd yt-clipper
+### 2. Configure GitHub Secrets
+To allow the workflows to authenticate with your social channels and AI providers, add the following secrets in your repository settings (**Settings $\rightarrow$ Secrets and variables $\rightarrow$ Actions**):
+
+| Secret Name | Description |
+| :--- | :--- |
+| `GEMINI_API_KEY` | Google Gemini API Key from [AI Studio](https://aistudio.google.com/apikey) |
+| `YT_CLIENT_ID` | Google Cloud Console OAuth Client ID |
+| `YT_CLIENT_SECRET` | Google Cloud Console OAuth Client Secret |
+| `YT_REFRESH_TOKEN` | Permanent Google OAuth Refresh Token with YouTube scope |
+| `FB_PAGE_ID` | Facebook Page ID for cross-posting and reels |
+| `FB_PAGE_ACCESS_TOKEN` | Facebook Long-Lived Page Access Token |
+| `IG_USER_ID` | Instagram Business Account ID linked to your FB Page |
+| `YT_COOKIES` *(Optional)* | Netscape-formatted `cookies.txt` content for robust YouTube authentication |
