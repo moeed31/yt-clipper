@@ -34,7 +34,6 @@ def record_clips(clip_ids: list[str]):
 
 
 def fetch_weekly_top_clips() -> list[dict]:
-    """Scans trending Twitch directories and pulls the top viewed clips from the past week."""
     recorded = load_recorded_clips()
     headers = {
         "Client-ID": "kimne78kx3ncx6brgo4mv6wki5h1ko",
@@ -42,33 +41,29 @@ def fetch_weekly_top_clips() -> list[dict]:
         "User-Agent": "Mozilla/5.0"
     }
 
-    # Fetch trending categories
-    trending_query = """
-    {
-      directories(first: 8, sort: VIEWS_DESC) {
-        edges {
-          node {
-            name
-          }
-        }
-      }
-    }
-    """
+    trending_games = [
+        "VALORANT", "Grand Theft Auto V", "Fortnite", "League of Legends",
+        "Counter-Strike", "Apex Legends", "Minecraft", "Call of Duty: Warzone",
+        "Dota 2", "Rocket League", "Tekken 8", "Street Fighter 6"
+    ]
+
     try:
-        r = requests.post("https://gql.twitch.tv/gql", headers=headers, json={"query": trending_query}, timeout=20)
+        r = requests.post("https://gql.twitch.tv/gql", headers=headers, json={"query": "{ directories(first: 12, sort: VIEWS_DESC) { edges { node { name } } } }"}, timeout=15)
         edges = (((r.json().get("data") or {}).get("directories") or {}).get("edges")) or []
-        games = [node.get("node", {}).get("name") for node in edges if node.get("node", {}).get("name")]
+        live_games = [node.get("node", {}).get("name") for node in edges if node.get("node", {}).get("name")]
+        if live_games:
+            trending_games = live_games + [g for g in trending_games if g not in live_games]
     except Exception:
-        games = ["VALORANT", "Grand Theft Auto V", "Fortnite", "League of Legends"]
+        pass
 
     candidates = []
     seen_ids = set(recorded)
 
-    for game_name in games:
+    for game_name in trending_games:
         inline_query = f"""
         {{
           game(name: "{game_name}") {{
-            clips(first: 10, criteria: {{ period: LAST_WEEK, sort: VIEWS_DESC }}) {{
+            clips(first: 15, criteria: {{ period: LAST_WEEK, sort: VIEWS_DESC }}) {{
               edges {{
                 node {{
                   slug
@@ -86,7 +81,7 @@ def fetch_weekly_top_clips() -> list[dict]:
         }}
         """
         try:
-            r = requests.post("https://gql.twitch.tv/gql", headers=headers, json={"query": inline_query}, timeout=25)
+            r = requests.post("https://gql.twitch.tv/gql", headers=headers, json={"query": inline_query}, timeout=20)
             edges = (((r.json().get("data") or {}).get("game") or {}).get("clips") or {}).get("edges") or []
             for edge in edges:
                 node = edge.get("node") or {}
@@ -95,7 +90,8 @@ def fetch_weekly_top_clips() -> list[dict]:
                 views = int(node.get("viewCount") or 0)
                 streamer = (node.get("broadcaster") or {}).get("displayName") or "Twitch"
 
-                if slug and slug not in seen_ids and 15.0 <= dur <= 55.0:
+                # Lowered minimum duration check to 10s and max to 60s for broader clip matching
+                if slug and slug not in seen_ids and 10.0 <= dur <= 60.0:
                     seen_ids.add(slug)
                     candidates.append({
                         "id": slug,
@@ -110,14 +106,13 @@ def fetch_weekly_top_clips() -> list[dict]:
             continue
 
     candidates.sort(key=lambda x: x["views"], reverse=True)
-    return candidates[:8] # Select top 8 clips for the weekly compilation
+    return candidates[:6] # Top 6 clips is ideal for a fast weekly compilation
 
 
 def download_clip_16x9(clip: dict, index: int) -> Path | None:
     raw_mp4 = (WORK_DIR / f"clip_{index}.mp4").resolve()
     raw_mp4.unlink(missing_ok=True)
     
-    # Download source clip
     cmd = [
         "yt-dlp", "--no-warnings", "--socket-timeout", "30",
         "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
@@ -128,7 +123,6 @@ def download_clip_16x9(clip: dict, index: int) -> Path | None:
         if proc.returncode != 0 or not raw_mp4.exists() or raw_mp4.stat().st_size < 50000:
             return None
 
-        # Convert/Pad clip into clean 16:9 widescreen with a sleek blurred background
         formatted_mp4 = (WORK_DIR / f"formatted_clip_{index}.mp4").resolve()
         vf = (
             "[0:v]scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080,boxblur=30:10[bg];"
@@ -183,7 +177,9 @@ def generate_weekly_thumbnail(top_clip_path: Path, out_jpg: Path):
 def main():
     print("[*] Fetching top Twitch clips for weekly compilation...", flush=True)
     clips = fetch_weekly_top_clips()
-    if len(clips) < 4:
+    
+    # Lowered threshold from 4 to 3 clips so it compiles successfully right away
+    if len(clips) < 3:
         print("[!] Not enough new clips found for a weekly compilation yet.", flush=True)
         return
 
@@ -197,11 +193,10 @@ def main():
             formatted_files.append(f_mp4)
             clip_ids.append(clip["id"])
 
-    if len(formatted_files) < 4:
+    if len(formatted_files) < 3:
         print("[!] Failed to process enough valid clips.", flush=True)
         return
 
-    # Stitch compilation files together using ffmpeg concat demuxer
     concat_list = (WORK_DIR / "concat.txt").resolve()
     with open(concat_list, "w", encoding="utf-8") as f:
         for fp in formatted_files:
@@ -217,7 +212,6 @@ def main():
     thumb_jpg = (WORK_DIR / "weekly_thumb.jpg").resolve()
     generate_weekly_thumbnail(formatted_files[0], thumb_jpg)
 
-    # Upload compilation to YouTube
     cid = os.environ.get("YT_CLIENT_ID", "").strip()
     csec = os.environ.get("YT_CLIENT_SECRET", "").strip()
     rtok = os.environ.get("YT_REFRESH_TOKEN", "").strip()
@@ -227,7 +221,7 @@ def main():
         creds = Credentials(token=None, refresh_token=rtok, token_uri="https://oauth2.googleapis.com/token", client_id=cid, client_secret=csec)
         youtube = build("youtube", "v3", credentials=creds)
 
-        title = f"Best Twitch Gaming Clips of the Week #1 | Epic Moments & Clutches"
+        title = f"Best Twitch Gaming Clips of the Week | Epic Moments & Clutches"
         desc = "The absolute best, most-watched Twitch clips from top streamers this week!\n\n#Twitch #Gaming #Clips #Compilation #TheRippersGaming"
 
         body = {
