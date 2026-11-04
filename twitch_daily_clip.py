@@ -9,6 +9,7 @@ import requests
 from datetime import datetime, timezone
 from pathlib import Path
 
+from google import genai
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -223,6 +224,39 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     print(f"[+] Rendered Vertical Short: {out_mp4.name}", flush=True)
 
 
+def build_viral_captions(clip_meta: dict, game_key: str) -> tuple[str, str]:
+    game_name = clip_meta["game"]
+    streamer = clip_meta["streamer"]
+    raw_title = clip_meta["title"]
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+
+    fallback_title = f"{raw_title[:50]} | @{streamer} ({game_name}) #Shorts"
+    fallback_caption = (
+        f"🔥 {raw_title} (@{streamer} on Twitch)\n"
+        f"🎮 {game_name} Insane Play!\n\n"
+        f"#Twitch #Gaming #Clips #Shorts #ViralGaming #TheRippersGaming"
+    )
+
+    if not api_key:
+        return fallback_title, fallback_caption
+
+    try:
+        client = genai.Client(api_key=api_key)
+        prompt = (
+            f"Twitch Clip Title: '{raw_title}' | Streamer: {streamer} | Game: {game_name}. "
+            "Write a high-converting, viral short-form video caption package. "
+            "Return ONLY raw JSON with keys: "
+            "'yt_title' (catchy YouTube Short title under 90 chars, include #Shorts), "
+            "'social_caption' (hype Instagram/Facebook Reels caption with emojis and 5 trending gaming hashtags)."
+        )
+        resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        parsed = json.loads(re.sub(r"^```json|```$", "", resp.text.strip(), flags=re.MULTILINE).strip())
+        return parsed.get("yt_title", fallback_title), parsed.get("social_caption", fallback_caption)
+    except Exception as e:
+        print(f"[!] AI Caption fallback used: {e}", flush=True)
+        return fallback_title, fallback_caption
+
+
 def upload_youtube_short(video_path: Path, title: str, description: str):
     cid = os.environ.get("YT_CLIENT_ID", "").strip()
     csec = os.environ.get("YT_CLIENT_SECRET", "").strip()
@@ -311,8 +345,7 @@ def main():
         final_short = (WORK_DIR / f"short_{i}.mp4").resolve()
         render_vertical_short(raw_mp4, clip_meta, final_short, whisper_model)
 
-        yt_title = f"{clip_meta['title'][:50]} | @{clip_meta['streamer']} ({clip_meta['game']}) #Shorts"
-        caption = f"🔥 {clip_meta['title']} (@{clip_meta['streamer']} on Twitch)\n👁️ {clip_meta['views']:,} views!\n\n#Twitch #Gaming #Clips #Shorts #TheRippersGaming"
+        yt_title, caption = build_viral_captions(clip_meta, clip_meta['game'])
 
         upload_youtube_short(final_short, yt_title, caption)
         upload_to_facebook_reels(final_short, caption)
