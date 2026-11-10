@@ -6,7 +6,6 @@ import time
 import shutil
 import subprocess
 import requests
-from datetime import datetime, timezone
 from pathlib import Path
 
 from google import genai
@@ -161,7 +160,89 @@ def format_ass_time(seconds: float) -> str:
     return f"{hrs}:{mins:02d}:{secs:05.2f}"
 
 
-def render_vertical_short(raw_mp4: Path, clip_meta: dict, out_mp4: Path, whisper_model: WhisperModel):
+def translate_and_polish_clip_data(raw_chunks: list[dict], clip_meta: dict) -> tuple[list[dict], str, str, str]:
+    """
+    Translates foreign Twitch clip titles & subtitle phrases into 100% viral English,
+    and generates the YouTube Short Title + Social Reels Caption in one fast Gemini call.
+    """
+    game_name = clip_meta["game"]
+    streamer = clip_meta["streamer"]
+    raw_title = clip_meta["title"]
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+
+    fallback_eng_title = re.sub(r"[^A-Za-z0-9 !?\-&]", "", raw_title).strip() or f"INSANE {game_name.upper()} PLAY!"
+    fallback_yt = f"{fallback_eng_title[:45]} | @{streamer} ({game_name}) #Shorts"
+    fallback_cap = (
+        f"🔥 {fallback_eng_title} (@{streamer} on Twitch)\n"
+        f"Rate this {game_name} moment 1-10 in the comments! 👇\n"
+        f"Follow @TheRippersGaming for daily gaming clips!\n\n"
+        f"#Twitch #Gaming #Clips #Shorts #TheRippersGaming"
+    )
+
+    if not api_key:
+        return raw_chunks, fallback_eng_title.upper()[:34], fallback_yt, fallback_cap
+
+    try:
+        client = genai.Client(api_key=api_key)
+        lines_payload = [{"i": idx, "t": c["text"]} for idx, c in enumerate(raw_chunks)]
+        prompt = f"""
+Twitch Clip Title: '{raw_title}' | Streamer: {streamer} | Game: {game_name}.
+Subtitle phrases: {json.dumps(lines_payload, ensure_ascii=False)}
+
+IMPORTANT: Everything MUST be translated and written in 100% natural, viral ENGLISH (even if the streamer/title is Korean, Japanese, Spanish, French, Portuguese, or Russian).
+
+Return ONLY raw valid JSON with keys:
+- "english_banner_title": Catchy 3-to-5 word ALL CAPS English banner title for the top of the video (max 32 chars).
+- "yt_title": High-CTR English YouTube Short title under 90 chars including @{streamer} and #Shorts.
+- "social_caption": Viral Instagram/Facebook Reels caption in English with emojis, a question to bait comments, a reminder to follow @TheRippersGaming, and 5 trending gaming hashtags.
+- "subs": Array of objects {{"i": index, "t": "ENGLISH ALL CAPS PHRASE (2-4 words)"}} matching the input subtitle phrases.
+"""
+        resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+        parsed = json.loads(re.sub(r"^```json|```$", "", resp.text.strip(), flags=re.MULTILINE).strip())
+
+        mapping = {int(item["i"]): str(item["t"]).upper().strip() for item in parsed.get("subs", []) if "i" in item and "t" in item}
+        for idx, c in enumerate(raw_chunks):
+            if idx in mapping and mapping[idx]:
+                c["text"] = mapping[idx]
+
+        eng_banner = str(parsed.get("english_banner_title") or fallback_eng_title).upper()[:34]
+        yt_t = str(parsed.get("yt_title") or fallback_yt)
+        soc_c = str(parsed.get("social_caption") or fallback_cap)
+        return raw_chunks, eng_banner, yt_t, soc_c
+    except Exception as e:
+        print(f"[!] Gemini translation/caption fallback used: {e}", flush=True)
+        return raw_chunks, fallback_eng_title.upper()[:34], fallback_yt, fallback_cap
+
+
+def build_hormozi_ass_events(raw_chunks: list[dict], clip_dur: float) -> list[str]:
+    events = []
+    for chunk in raw_chunks:
+        s_t = max(0.0, float(chunk["start"]))
+        e_t = min(clip_dur, float(chunk["end"]))
+        if e_t <= s_t:
+            continue
+        clean_phrase = re.sub(r"[{}\\]", "", chunk["text"]).strip().upper()
+        words = [w for w in clean_phrase.split() if w]
+        if not words:
+            continue
+
+        total_dur = max(0.15, e_t - s_t)
+        word_step = total_dur / len(words)
+
+        for w_idx in range(len(words)):
+            w_start = s_t + (w_idx * word_step)
+            w_end = s_t + ((w_idx + 1) * word_step) if w_idx < len(words) - 1 else e_t
+            formatted_words = []
+            for j, word_str in enumerate(words):
+                if j == w_idx:
+                    formatted_words.append(r"{\c&H0000FFFF&\fscx118\fscy118}" + word_str + r"{\c&H00FFFFFF&\fscx100\fscy100}")
+                else:
+                    formatted_words.append(word_str)
+            events.append(f"Dialogue: 2,{format_ass_time(w_start)},{format_ass_time(w_end)},WordSub,,0,0,0,,{' '.join(formatted_words)}")
+    return events
+
+
+def render_vertical_short(raw_mp4: Path, clip_meta: dict, out_mp4: Path, whisper_model: WhisperModel) -> tuple[str, str]:
     probe_cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(raw_mp4.resolve())]
     clip_dur = min(58.0, float(subprocess.check_output(probe_cmd, timeout=20).decode().strip()))
 
@@ -170,7 +251,43 @@ def render_vertical_short(raw_mp4: Path, clip_meta: dict, out_mp4: Path, whisper
 
     subprocess.run(["ffmpeg", "-y", "-i", str(raw_mp4.resolve()), "-t", str(clip_dur), "-vn", "-ac", "1", "-ar", "16000", str(wav_clip)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=True)
 
-    segments_gen, _ = whisper_model.transcribe(str(wav_clip), word_timestamps=True)
+    # task="translate" ensures foreign Twitch clips get English speech translation
+    segments_gen, _ = whisper_model.transcribe(str(wav_clip), task="translate", word_timestamps=True, beam_size=5)
+
+    raw_chunks = []
+    for seg in segments_gen:
+        if seg.words:
+            chunk = []
+            for w in seg.words:
+                chunk.append(w)
+                if len(chunk) == 3:
+                    raw_chunks.append({
+                        "start": max(0.0, chunk[0].start),
+                        "end": min(clip_dur, chunk[-1].end),
+                        "text": " ".join(x.word.strip() for x in chunk)
+                    })
+                    chunk = []
+            if chunk:
+                raw_chunks.append({
+                    "start": max(0.0, chunk[0].start),
+                    "end": min(clip_dur, chunk[-1].end),
+                    "text": " ".join(x.word.strip() for x in chunk)
+                })
+        elif seg.text.strip():
+            words = seg.text.strip().split()
+            seg_dur = max(0.5, seg.end - seg.start)
+            num_groups = max(1, (len(words) + 2) // 3)
+            step = seg_dur / num_groups
+            for g_idx in range(num_groups):
+                grp = words[g_idx * 3:(g_idx + 1) * 3]
+                raw_chunks.append({
+                    "start": max(0.0, seg.start + g_idx * step),
+                    "end": min(clip_dur, seg.start + (g_idx + 1) * step),
+                    "text": " ".join(grp)
+                })
+
+    raw_chunks, eng_banner, yt_title, social_caption = translate_and_polish_clip_data(raw_chunks, clip_meta)
+
     ass_header = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -179,36 +296,27 @@ PlayResY: 1920
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: TopBanner,DejaVu Sans,50,&H00FFFFFF,&H000000FF,&H00000000,&H969146FF,-1,0,0,0,100,100,0,0,3,16,0,8,40,40,170,1
-Style: WordSub,DejaVu Sans,68,&H0000FFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,6,3,2,60,60,310,1
+Style: WordSub,DejaVu Sans,70,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,7,4,2,60,60,330,1
+Style: Watermark,DejaVu Sans,30,&H80FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,2,0,1,3,1,2,40,40,185,1
+Style: SubscribeCTA,DejaVu Sans,46,&H00FFFFFF,&H0000FFFF,&H00000000,&HD80000FF,-1,0,0,0,100,100,0,0,3,18,0,2,40,40,115,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
-    clean_streamer = re.sub(r"[^A-Za-z0-9_]", "", clip_meta["streamer"])[:22]
-    clean_title = re.sub(r"[^A-Za-z0-9 !?\-&]", "", clip_meta["title"]).strip()[:34]
+    clean_streamer = re.sub(r"[^A-Za-z0-9_]", "", clip_meta["streamer"])[:20] or "TWITCH"
+    clean_banner = re.sub(r"[^A-Za-z0-9 !?\-&]", "", eng_banner).strip()[:34]
+    cta_start = max(3.0, clip_dur - 3.5)
 
-    events = [f"Dialogue: 0,0:00:00.00,{format_ass_time(clip_dur)},TopBanner,,0,0,0,,@{clean_streamer.upper()} • {clip_meta['game'].upper()}\\N{clean_title.upper()}"]
-
-    for seg in segments_gen:
-        if not seg.words:
-            continue
-        chunk = []
-        for w in seg.words:
-            chunk.append(w)
-            if len(chunk) == 3:
-                s_t = format_ass_time(max(0.0, chunk[0].start))
-                e_t = format_ass_time(min(clip_dur, chunk[-1].end))
-                txt = re.sub(r"[{}\\]", "", " ".join(x.word.strip().upper() for x in chunk))
-                events.append(f"Dialogue: 1,{s_t},{e_t},WordSub,,0,0,0,,{txt}")
-                chunk = []
-        if chunk:
-            s_t = format_ass_time(max(0.0, chunk[0].start))
-            e_t = format_ass_time(min(clip_dur, chunk[-1].end))
-            txt = re.sub(r"[{}\\]", "", " ".join(x.word.strip().upper() for x in chunk))
-            events.append(f"Dialogue: 1,{s_t},{e_t},WordSub,,0,0,0,,{txt}")
+    events = [
+        f"Dialogue: 0,0:00:00.00,{format_ass_time(clip_dur)},TopBanner,,0,0,0,,@{clean_streamer.upper()} • {clip_meta['game'].upper()}\\N{clean_banner}",
+        f"Dialogue: 0,0:00:00.00,{format_ass_time(cta_start)},Watermark,,0,0,0,,@THERIPPERSGAMING",
+        f"Dialogue: 3,{format_ass_time(cta_start)},{format_ass_time(clip_dur)},SubscribeCTA,,0,0,0,,SUBSCRIBE & FOLLOW @THERIPPERSGAMING\\NFOR DAILY GAMING CLIPS!"
+    ]
+    events.extend(build_hormozi_ass_events(raw_chunks, clip_dur))
 
     ass_file.write_text(ass_header + "\n".join(events) + "\n", encoding="utf-8")
 
+    # Full 16:9 HUD preserved (1080:-2)
     vf_complex = (
         "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5[bg];"
         "[0:v]scale=1080:-2:force_original_aspect_ratio=decrease[fg];"
@@ -220,41 +328,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-r", "30",
         "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2",
         str(out_mp4.resolve())
-    ], cwd=str(WORK_DIR.resolve()), timeout=180, check=True)
-    print(f"[+] Rendered Vertical Short: {out_mp4.name}", flush=True)
-
-
-def build_viral_captions(clip_meta: dict, game_key: str) -> tuple[str, str]:
-    game_name = clip_meta["game"]
-    streamer = clip_meta["streamer"]
-    raw_title = clip_meta["title"]
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-
-    fallback_title = f"{raw_title[:50]} | @{streamer} ({game_name}) #Shorts"
-    fallback_caption = (
-        f"🔥 {raw_title} (@{streamer} on Twitch)\n"
-        f"🎮 {game_name} Insane Play!\n\n"
-        f"#Twitch #Gaming #Clips #Shorts #ViralGaming #TheRippersGaming"
-    )
-
-    if not api_key:
-        return fallback_title, fallback_caption
-
-    try:
-        client = genai.Client(api_key=api_key)
-        prompt = (
-            f"Twitch Clip Title: '{raw_title}' | Streamer: {streamer} | Game: {game_name}. "
-            "Write a high-converting, viral short-form video caption package. "
-            "Return ONLY raw JSON with keys: "
-            "'yt_title' (catchy YouTube Short title under 90 chars, include #Shorts), "
-            "'social_caption' (hype Instagram/Facebook Reels caption with emojis and 5 trending gaming hashtags)."
-        )
-        resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-        parsed = json.loads(re.sub(r"^```json|```$", "", resp.text.strip(), flags=re.MULTILINE).strip())
-        return parsed.get("yt_title", fallback_title), parsed.get("social_caption", fallback_caption)
-    except Exception as e:
-        print(f"[!] AI Caption fallback used: {e}", flush=True)
-        return fallback_title, fallback_caption
+    ], cwd=str(WORK_DIR.resolve()), timeout=240, check=True)
+    print(f"[+] Rendered 100% English Vertical Short: {out_mp4.name}", flush=True)
+    return yt_title, social_caption
 
 
 def upload_youtube_short(video_path: Path, title: str, description: str):
@@ -274,7 +350,10 @@ def upload_youtube_short(video_path: Path, title: str, description: str):
             _, res = req.next_chunk()
         print(f"[+] YouTube Short Uploaded: https://youtube.com/shorts/{res['id']}", flush=True)
     except Exception as e:
-        print(f"[-] YouTube Error: {e}", flush=True)
+        if "uploadLimitExceeded" in str(e):
+            print("[!] YouTube Daily Upload Limit Reached! Continuing to Facebook & Instagram Reels...", flush=True)
+        else:
+            print(f"[-] YouTube Error: {e}", flush=True)
 
 
 def upload_to_facebook_reels(video_path: Path, caption: str):
@@ -333,8 +412,8 @@ def main():
         print("[!] No new unique trending clips found right now.", flush=True)
         return
 
-    print("[*] Loading faster-whisper model...", flush=True)
-    whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+    print("[*] Loading faster-whisper ('small' multilingual-to-English model)...", flush=True)
+    whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
 
     for i, clip_meta in enumerate(clips):
         print(f"\n--- Processing Clip {i+1}/2: '{clip_meta['title']}' by {clip_meta['streamer']} ({clip_meta['game']}) ---", flush=True)
@@ -343,9 +422,7 @@ def main():
             continue
 
         final_short = (WORK_DIR / f"short_{i}.mp4").resolve()
-        render_vertical_short(raw_mp4, clip_meta, final_short, whisper_model)
-
-        yt_title, caption = build_viral_captions(clip_meta, clip_meta['game'])
+        yt_title, caption = render_vertical_short(raw_mp4, clip_meta, final_short, whisper_model)
 
         upload_youtube_short(final_short, yt_title, caption)
         upload_to_facebook_reels(final_short, caption)
