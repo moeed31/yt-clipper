@@ -671,15 +671,12 @@ def generate_custom_thumbnail(source_vod: Path, thumb_sec: float, game_key: str,
     draw = ImageDraw.Draw(overlay)
 
     accent = GAME_CONFIG[game_key]["accent_color"]
-    # Bottom dark gradient box & outer neon border
     draw.rectangle([0, 465, 1280, 720], fill=(8, 8, 14, 230))
     draw.rectangle([0, 0, 1280, 720], outline=accent + (255,), width=16)
 
-    # Top-Right Viral Shock Badge (Bright Yellow with Black text for maximum CTR)
     shock_clean = re.sub(r"[^A-Za-z0-9 !?]", "", shock_tag).strip().upper()[:22] or "MUST WATCH!"
     draw.rectangle([760, 35, 1245, 115], fill=(255, 215, 0, 255), outline=(0, 0, 0, 255), width=4)
 
-    # Mid-left Game Mode Tag
     draw.rectangle([40, 440, 480, 495], fill=accent + (255,))
 
     try:
@@ -711,10 +708,6 @@ def format_ass_time(seconds: float) -> str:
 
 
 def translate_and_polish_subtitles_to_english(raw_chunks: list[dict], game_name: str, model_name: str) -> list[dict]:
-    """
-    Guarantees 100% natural, hype English esports subtitles even if the source audio
-    was Korean, Japanese, Spanish, Portuguese, French, Russian, or noisy commentary.
-    """
     if not raw_chunks:
         return []
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -745,10 +738,6 @@ def translate_and_polish_subtitles_to_english(raw_chunks: list[dict], game_name:
 
 
 def build_hormozi_ass_events(raw_chunks: list[dict], clip_dur: float) -> list[str]:
-    """
-    Creates Hormozi-style active word pop-ups where the currently spoken word scales up (118%)
-    and highlights in bright yellow (&H0000FFFF&) while surrounding words in the 3-word chunk stay crisp white.
-    """
     events = []
     for chunk in raw_chunks:
         s_t = max(0.0, float(chunk["start"]))
@@ -769,7 +758,6 @@ def build_hormozi_ass_events(raw_chunks: list[dict], clip_dur: float) -> list[st
             formatted_words = []
             for j, word_str in enumerate(words):
                 if j == w_idx:
-                    # Active word: Neon Yellow + 118% Pop Scale
                     formatted_words.append(r"{\c&H0000FFFF&\fscx118\fscy118}" + word_str + r"{\c&H00FFFFFF&\fscx100\fscy100}")
                 else:
                     formatted_words.append(word_str)
@@ -807,7 +795,6 @@ def render_9x16_short(
         "ffmpeg", "-y", "-i", str(raw_clip), "-vn", "-ac", "1", "-ar", "16000", str(wav_clip)
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=True)
 
-    # task="translate" forces Whisper to translate any non-English speech directly into English!
     segments_gen, info = whisper_model.transcribe(
         str(wav_clip),
         task="translate",
@@ -837,7 +824,6 @@ def render_9x16_short(
                     "text": " ".join(x.word.strip() for x in chunk)
                 })
         elif seg.text.strip():
-            # Fallback if a translated segment doesn't emit word-level splits
             words = seg.text.strip().split()
             seg_dur = max(0.5, seg.end - seg.start)
             num_groups = max(1, (len(words) + 2) // 3)
@@ -850,7 +836,6 @@ def render_9x16_short(
                     "text": " ".join(grp)
                 })
 
-    # Run Gemini English verification & esports slang polish
     raw_chunks = translate_and_polish_subtitles_to_english(raw_chunks, GAME_CONFIG[game_key]["name"], active_model)
 
     ass_header = """[Script Info]
@@ -874,20 +859,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     cta_start = max(3.5, clip_dur - 3.5)
 
     events = [
-        # Permanent Top Match Header
         f"Dialogue: 0,0:00:00.00,{format_ass_time(clip_dur)},TopBanner,,0,0,0,,{GAME_CONFIG[game_key]['name'].upper()}\\N{clean_banner}",
-        # First 3.2s High-Retention Hook Banner
         f"Dialogue: 1,0:00:00.00,{format_ass_time(min(3.2, clip_dur))},HookBanner,,0,0,0,,🔥 {clean_hook}",
-        # Subtle Brand Watermark
         f"Dialogue: 0,0:00:00.00,{format_ass_time(cta_start)},Watermark,,0,0,0,,@THERIPPERSGAMING",
-        # Final 3.5s Subscribe & Follow CTA Popup
         f"Dialogue: 3,{format_ass_time(cta_start)},{format_ass_time(clip_dur)},SubscribeCTA,,0,0,0,,SUBSCRIBE & FOLLOW @THERIPPERSGAMING\\NFOR DAILY PRO HIGHLIGHTS!"
     ]
 
     events.extend(build_hormozi_ass_events(raw_chunks, clip_dur))
     ass_file.write_text(ass_header + "\n".join(events) + "\n", encoding="utf-8")
 
-    # Full 16:9 HUD preserved (1080:-2) over blurred background
     vf_complex = (
         "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5[bg];"
         "[0:v]scale=1080:-2:force_original_aspect_ratio=decrease[fg];"
@@ -972,7 +952,7 @@ Return ONLY raw valid JSON with keys:
 
 
 # ==============================================================================
-# 7. MULTI-PLATFORM PUBLISHERS (WITH QUOTA-SAFE YOUTUBE FALLBACK)
+# 7. MULTI-PLATFORM PUBLISHERS (WITH QUOTA-SAFE YOUTUBE & GIT REBASE FALLBACK)
 # ==============================================================================
 def get_youtube_client():
     cid = os.environ.get("YT_CLIENT_ID", "").strip()
@@ -1152,6 +1132,7 @@ def stage_video_for_instagram(video_path: Path, idx: int) -> str | None:
 
             subprocess.run(["git", "add", "-f", str(staged_path)], timeout=30, check=True)
             subprocess.run(["git", "commit", "-m", f"temp: stage reel {idx} for IG [skip ci]"], timeout=30, check=True)
+            subprocess.run(["git", "pull", "--rebase", "-X", "ours", "origin", branch], timeout=60, check=False)
             subprocess.run(["git", "push", "origin", f"HEAD:{branch}"], timeout=60, check=True)
 
             raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/ig_stage/{stage_filename}"
