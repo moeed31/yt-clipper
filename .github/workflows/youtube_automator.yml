@@ -1,13 +1,13 @@
-name: 9-Game Tournament Clipper & Multi-Platform Automator
+name: Multi-Game Esports Tournament Automator
 
 on:
   schedule:
     - cron: '0 */6 * * *' # Runs automatically every 6 hours
   workflow_dispatch:
     inputs:
-      game:
-        description: 'Select Game (or auto to rotate all 9 games)'
-        required: true
+      target_game:
+        description: 'Select Target Game (or leave on auto for rotation)'
+        required: false
         default: 'auto'
         type: choice
         options:
@@ -21,20 +21,26 @@ on:
           - cod
           - tekken
           - lol
-      vod_url:
-        description: 'Optional: Specific YouTube VOD URL (leave blank for auto-search)'
+      custom_vod_url:
+        description: 'Optional: Custom YouTube VOD URL to process'
         required: false
         default: ''
+        type: string
       shorts_count:
-        description: 'Number of Shorts/Reels to generate (1-3)'
-        required: true
+        description: 'Number of 9:16 Vertical Shorts to generate'
+        required: false
         default: '2'
+        type: string
+
+concurrency:
+  group: repo-git-sync
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
-  clip_and_publish:
+  run_esports_pipeline:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -47,66 +53,49 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install System Dependencies (FFmpeg, Fonts, ImageMagick, Deno, Docker)
+      - name: Install FFmpeg, Deno & Fonts
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-liberation fonts-dejavu-core imagemagick curl unzip
+          sudo apt-get install -y ffmpeg fonts-liberation fonts-dejavu-core unzip curl
           curl -fsSL https://deno.land/install.sh | sh
           echo "$HOME/.deno/bin" >> $GITHUB_PATH
+
+      - name: Start YouTube PO-Token Provider (bgutil-ytdlp-pot-provider)
+        run: |
+          docker run -d -p 4416:4416 --name pot-provider brainicism/bgutil-ytdlp-pot-provider
+          sleep 5
 
       - name: Configure Git for Instagram Staging & State Tracking
         run: |
           git config --local user.email "actions@github.com"
           git config --local user.name "Esports Automator Bot"
 
-      - name: Start YouTube PO-Token Provider Server (Bypass Bot Check)
-        run: |
-          docker run -d --name bgutil-pot -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider:latest
-          sleep 5
-
       - name: Install Python Packages
         run: |
           pip install --upgrade pip
-          pip install "yt-dlp[default,curl-cffi]" yt-dlp-ejs bgutil-ytdlp-pot-provider
-          pip install faster-whisper numpy pillow requests google-genai
+          pip install "yt-dlp[default,curl-cffi]" bgutil-ytdlp-pot-provider
+          pip install faster-whisper requests numpy pillow google-genai
           pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
 
-      - name: Prepare Netscape YouTube Cookies (Auto-Repair Formatting)
+      - name: Write YouTube Cookies (If Provided)
         env:
-          RAW_COOKIES: ${{ secrets.YT_COOKIES }}
+          YT_COOKIES_RAW: ${{ secrets.YT_COOKIES }}
         run: |
-          python3 -c '
-          import os
-          raw = os.environ.get("RAW_COOKIES", "").strip()
-          if raw:
-              lines = ["#" + " Netscape HTTP Cookie File"]
-              for line in raw.splitlines():
-                  s = line.strip()
-                  if not s or s.startswith("#"):
-                      continue
-                  parts = s.split("\t") if "\t" in s else s.split()
-                  if len(parts) >= 7:
-                      domain = parts[0]
-                      flag = "TRUE" if domain.startswith(".") else "FALSE"
-                      path = parts[2]
-                      secure = parts[3].upper() if parts[3].upper() in ("TRUE", "FALSE") else "TRUE"
-                      expiry = parts[4] if parts[4].isdigit() else "1893456000"
-                      name = parts[5]
-                      val = parts[6]
-                      lines.append(f"{domain}\t{flag}\t{path}\t{secure}\t{expiry}\t{name}\t{val}")
-              with open("cookies.txt", "w", encoding="utf-8") as f:
-                  f.write("\n".join(lines) + "\n")
-              print(f"[+] Wrote {len(lines)-1} repaired cookies to cookies.txt")
-          '
+          if [ -n "$YT_COOKIES_RAW" ]; then
+            printf "%s\n" "$YT_COOKIES_RAW" > cookies.txt
+            echo "[+] cookies.txt written ($(wc -c < cookies.txt) bytes)"
+          else
+            echo "[*] No YT_COOKIES secret found; relying on PO-Token provider."
+          fi
 
-      - name: Run Multi-Platform Esports Pipeline
+      - name: Execute Multi-Platform Tournament Pipeline
         env:
           PYTHONUNBUFFERED: '1'
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
-          TARGET_GAME: ${{ github.event.inputs.game || 'auto' }}
-          CUSTOM_VOD_URL: ${{ github.event.inputs.vod_url || '' }}
-          SHORTS_COUNT: ${{ github.event.inputs.shorts_count || '2' }}
+          TARGET_GAME: ${{ inputs.target_game || 'auto' }}
+          CUSTOM_VOD_URL: ${{ inputs.custom_vod_url || '' }}
+          SHORTS_COUNT: ${{ inputs.shorts_count || '2' }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
@@ -117,9 +106,15 @@ jobs:
         run: |
           python3 pipeline.py
 
-      - name: Clean Up Temporary IG Files & Commit Updated State
+      - name: Clean Up Temporary IG Files & Commit Processed VODs
         if: always()
         run: |
-          rm -rf ig_stage/
+          rm -rf ig_stage/ cookies.txt
           git add -A ig_stage/ processed_vods.txt playlists.json 2>/dev/null || true
-          git diff --staged --quiet || (git commit -m "chore: update processed VODs and clean staging [skip ci]" && git push)
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: update processed VODs and clean staging [skip ci]"
+            for i in 1 2 3; do
+              git pull --rebase -X ours origin ${{ github.ref_name }} && git push origin HEAD:${{ github.ref_name }} && break
+              sleep 5
+            done
+          fi
