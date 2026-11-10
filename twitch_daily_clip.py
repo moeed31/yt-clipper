@@ -161,10 +161,6 @@ def format_ass_time(seconds: float) -> str:
 
 
 def translate_and_polish_clip_data(raw_chunks: list[dict], clip_meta: dict) -> tuple[list[dict], str, str, str]:
-    """
-    Translates foreign Twitch clip titles & subtitle phrases into 100% viral English,
-    and generates the YouTube Short Title + Social Reels Caption in one fast Gemini call.
-    """
     game_name = clip_meta["game"]
     streamer = clip_meta["streamer"]
     raw_title = clip_meta["title"]
@@ -251,7 +247,6 @@ def render_vertical_short(raw_mp4: Path, clip_meta: dict, out_mp4: Path, whisper
 
     subprocess.run(["ffmpeg", "-y", "-i", str(raw_mp4.resolve()), "-t", str(clip_dur), "-vn", "-ac", "1", "-ar", "16000", str(wav_clip)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=True)
 
-    # task="translate" ensures foreign Twitch clips get English speech translation
     segments_gen, _ = whisper_model.transcribe(str(wav_clip), task="translate", word_timestamps=True, beam_size=5)
 
     raw_chunks = []
@@ -316,7 +311,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     ass_file.write_text(ass_header + "\n".join(events) + "\n", encoding="utf-8")
 
-    # Full 16:9 HUD preserved (1080:-2)
     vf_complex = (
         "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5[bg];"
         "[0:v]scale=1080:-2:force_original_aspect_ratio=decrease[fg];"
@@ -385,6 +379,7 @@ def upload_to_instagram_reels(video_path: Path, caption: str, idx: int):
         shutil.copy2(video_path.resolve(), staged_path)
         subprocess.run(["git", "add", "-f", str(staged_path)], timeout=30, check=True)
         subprocess.run(["git", "commit", "-m", f"temp: stage twitch reel {idx} [skip ci]"], timeout=30, check=True)
+        subprocess.run(["git", "pull", "--rebase", "-X", "ours", "origin", branch], timeout=60, check=False)
         subprocess.run(["git", "push", "origin", f"HEAD:{branch}"], timeout=60, check=True)
 
         raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/ig_stage/{stage_filename}"
