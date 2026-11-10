@@ -221,10 +221,6 @@ def get_ytdlp_base_args() -> list[str]:
 
 
 def search_candidates_for_game(game_key: str, processed_ids: set) -> list[tuple[str, int]]:
-    """
-    Searches across ALL queries for a game (up to 30 results per query) and accepts
-    VODs from 12 minutes (720s) up to 3 hours (10800s) so R6, COD, and Tekken never fail!
-    """
     game_info = GAME_CONFIG[game_key]
     queries = list(game_info["queries"])
     random.shuffle(queries)
@@ -250,18 +246,15 @@ def search_candidates_for_game(game_key: str, processed_ids: set) -> list[tuple[
                     continue
                 if live_status in ("is_live", "is_upcoming"):
                     continue
-                # Accept 12 mins (720s) to 3 hours (10800s)
                 if 720 <= duration <= 10800:
                     seen.add(vid_id)
                     candidates.append((f"https://www.youtube.com/watch?v={vid_id}", duration))
             except Exception:
                 continue
 
-        # As soon as we have at least 5 strong candidates, stop searching more queries
         if len(candidates) >= 5:
             break
 
-    # Prefer single-map / single-set VODs (15–55 mins) first for fastest download speed
     candidates.sort(key=lambda x: 0 if 900 <= x[1] <= 3300 else 1)
     return candidates
 
@@ -271,7 +264,6 @@ def find_and_download_vod(initial_game_key: str) -> tuple[Path, dict, str]:
     processed_ids = load_processed_vods()
     output_template = str((WORK_DIR / "source_vod.%(ext)s").resolve())
 
-    # Build rotation order starting with initial_game_key so if one game has 0 results, it tries the next
     all_keys = list(GAME_CONFIG.keys())
     start_idx = all_keys.index(initial_game_key) if initial_game_key in all_keys else 0
     ordered_games = all_keys[start_idx:] + all_keys[:start_idx]
@@ -312,8 +304,6 @@ def find_and_download_vod(initial_game_key: str) -> tuple[Path, dict, str]:
                 if info_path.exists():
                     info_data = json.loads(info_path.read_text(encoding="utf-8", errors="ignore"))
 
-                # If the downloaded VOD is longer than 50 minutes (e.g. a 2-hour BO5 series),
-                # fast-trim the active 45-minute match block locally with stream copy (-c copy) in 3 seconds!
                 actual_dur = int(info_data.get("duration") or dur or 0)
                 if actual_dur > 3000:
                     trimmed_mp4 = (WORK_DIR / "source_vod_trimmed.mp4").resolve()
@@ -335,7 +325,7 @@ def find_and_download_vod(initial_game_key: str) -> tuple[Path, dict, str]:
 # ==============================================================================
 # 4. HANG-PROOF HIGHLIGHT ENGINE (2-CHUNK GEMINI VISION + DISK-BASED FALLBACK)
 # ==============================================================================
-def get_audio_fallback_segments(video_path: Path, game_key: str, total_duration: float) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+def get_audio_fallback_segments(video_path: Path, game_key: str, total_duration: float) -> tuple[list[tuple[float, float]], list[dict]]:
     print("[*] Running silence-aware audio highlight analysis (disk-buffered)...", flush=True)
     game_type = GAME_CONFIG[game_key]["type"]
     pcm_file = (WORK_DIR / "audio_energy.pcm").resolve()
@@ -352,7 +342,7 @@ def get_audio_fallback_segments(video_path: Path, game_key: str, total_duration:
     samples_per_sec = 4000
     num_seconds = len(audio_samples) // samples_per_sec
     if num_seconds < 240:
-        return [(0.0, total_duration)], [(10.0, min(58.0, total_duration))]
+        return [(0.0, total_duration)], [{"start": 10.0, "end": min(58.0, total_duration), "hook": "WAIT FOR THE CLUTCH!"}]
 
     trimmed = audio_samples[:num_seconds * samples_per_sec].reshape((num_seconds, samples_per_sec))
     rms_per_sec = np.sqrt(np.mean(trimmed ** 2, axis=1))
@@ -370,17 +360,29 @@ def get_audio_fallback_segments(video_path: Path, game_key: str, total_duration:
                 return float(min(total_duration, t + 6.0))
         return float(min(total_duration, search_end))
 
+    default_hooks = [
+        "UNREAL PRO CLUTCH!",
+        "HOW DID HE SURVIVE THIS?!",
+        "200 IQ TOURNAMENT PLAY!",
+        "INSANE FINAL MOMENTS!",
+        "ABSOLUTE CINEMA!"
+    ]
+
     shorts_energy = smoothed.copy()
     shorts_energy[:start_bound] = 0
     shorts_energy[end_bound:] = 0
     short_windows = []
-    for _ in range(5):
+    for idx in range(5):
         p = int(np.argmax(shorts_energy))
         if shorts_energy[p] <= 0:
             break
         s_end = find_natural_round_end(p, min_tail=35, max_tail=48)
         s_start = max(5.0, s_end - 58.0)
-        short_windows.append((round(s_start, 2), round(s_end, 2)))
+        short_windows.append({
+            "start": round(s_start, 2),
+            "end": round(s_end, 2),
+            "hook": default_hooks[idx % len(default_hooks)]
+        })
         shorts_energy[max(0, p - 80):min(num_seconds, p + 80)] = 0
 
     segments = []
@@ -432,7 +434,7 @@ def get_audio_fallback_segments(video_path: Path, game_key: str, total_duration:
     return final_segs, short_windows
 
 
-def get_ai_highlight_segments(video_path: Path, game_key: str) -> tuple[list[tuple[float, float]], list[tuple[float, float]], str]:
+def get_ai_highlight_segments(video_path: Path, game_key: str) -> tuple[list[tuple[float, float]], list[dict], str]:
     probe_cmd = [
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1", str(video_path.resolve())
@@ -512,11 +514,12 @@ Timestamps must be relative to THIS video file (from 0.0 to {c_dur:.0f}).
 {chunk_goal}
 
 Also pick the top 2 most explosive clutches or squad wipes in this half for vertical Shorts (each Short window must be 45 to 58 seconds long and end 4 seconds AFTER the final kill / round-win banner).
+For each Short, provide an ultra-catchy 3-to-5 word English 'hook' in ALL CAPS (e.g. '1 HP ACE CLUTCH?!', 'UNREAL FINAL CIRCLE!', '200 IQ OUTPLAY!').
 
 Return ONLY raw valid JSON:
 {{
   "recap_segments": [{{"start": 45.0, "end": 105.0}}],
-  "short_segments": [{{"start": 210.0, "end": 266.0}}]
+  "short_segments": [{{"start": 210.0, "end": 266.0, "hook": "1 HP ACE CLUTCH?!"}}]
 }}
 """
             print(f"[*] Analyzing {label} with {model_name}...", flush=True)
@@ -538,7 +541,11 @@ Return ONLY raw valid JSON:
             for item in data.get("recap_segments", []):
                 all_recap_raw.append({"start": float(item["start"]) + c_start, "end": float(item["end"]) + c_start})
             for item in data.get("short_segments", []):
-                all_shorts_raw.append({"start": float(item["start"]) + c_start, "end": float(item["end"]) + c_start})
+                all_shorts_raw.append({
+                    "start": float(item["start"]) + c_start,
+                    "end": float(item["end"]) + c_start,
+                    "hook": str(item.get("hook") or "INSANE PRO CLUTCH!").upper()
+                })
 
         segments = []
         for item in all_recap_raw:
@@ -555,7 +562,11 @@ Return ONLY raw valid JSON:
                 s = e - 58.0
             elif e - s < 35.0:
                 s = max(0.0, e - 50.0)
-            short_windows.append((round(s, 2), round(e, 2)))
+            short_windows.append({
+                "start": round(s, 2),
+                "end": round(e, 2),
+                "hook": item.get("hook", "INSANE PRO CLUTCH!")
+            })
 
         if len(segments) >= 3 and len(short_windows) >= 1:
             segments.sort(key=lambda x: x[0])
@@ -579,12 +590,24 @@ Return ONLY raw valid JSON:
 
 
 # ==============================================================================
-# 5. VIDEO RENDERING: 16:9 RECAP, CUSTOM THUMBNAIL & 9:16 SUBTITLED SHORTS
+# 5. VIDEO RENDERING: 16:9 RECAP, VIRAL THUMBNAIL & 9:16 ENGLISH SHORTS
 # ==============================================================================
-def render_16x9_recap(source_vod: Path, segments: list[tuple[float, float]], output_path: Path):
+def format_yt_timestamp(seconds: float) -> str:
+    hrs = int(seconds // 3600)
+    mins = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    if hrs > 0:
+        return f"{hrs}:{mins:02d}:{secs:02d}"
+    return f"{mins:02d}:{secs:02d}"
+
+
+def render_16x9_recap(source_vod: Path, segments: list[tuple[float, float]], output_path: Path, game_key: str) -> str:
     print(f"[*] Rendering 16:9 Recap across {len(segments)} segments...", flush=True)
     concat_list_file = (WORK_DIR / "concat_list.txt").resolve()
     part_files = []
+    chapters = ["00:00 Match Intro & Opening Highlights"]
+    running_time = 0.0
+    is_br = GAME_CONFIG[game_key]["type"] == "battle_royale"
 
     for idx, (start_t, end_t) in enumerate(segments):
         dur = round(end_t - start_t, 2)
@@ -603,6 +626,14 @@ def render_16x9_recap(source_vod: Path, segments: list[tuple[float, float]], out
         try:
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180, check=True)
             part_files.append(part_path)
+            if idx > 0:
+                if is_br and idx == len(segments) - 1:
+                    chapters.append(f"{format_yt_timestamp(running_time)} Final Circle Showdown & Winner")
+                elif is_br:
+                    chapters.append(f"{format_yt_timestamp(running_time)} Squad Fight #{idx+1}")
+                else:
+                    chapters.append(f"{format_yt_timestamp(running_time)} Key Round Highlight #{idx+1}")
+            running_time += dur
         except Exception as e:
             print(f"[!] Segment {idx} skipped: {e}", flush=True)
 
@@ -618,42 +649,58 @@ def render_16x9_recap(source_vod: Path, segments: list[tuple[float, float]], out
     for p in part_files:
         p.unlink(missing_ok=True)
     print(f"[+] Rendered 16:9 Full Match Recap: {output_path.name}", flush=True)
+    return "\n".join(chapters)
 
 
-def generate_custom_thumbnail(source_vod: Path, thumb_sec: float, game_key: str, headline: str, out_jpg: Path):
+def generate_custom_thumbnail(source_vod: Path, thumb_sec: float, game_key: str, headline: str, shock_tag: str, out_jpg: Path):
     raw_frame = (WORK_DIR / "thumb_raw.jpg").resolve()
     subprocess.run([
         "ffmpeg", "-y", "-ss", str(thumb_sec), "-i", str(source_vod.resolve()),
         "-frames:v", "1", "-q:v", "2", str(raw_frame)
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
 
-    img = Image.open(raw_frame).convert("RGBA").resize((1280, 720), Image.Resampling.LANCZOS)
-    img = ImageEnhance.Color(img).enhance(1.35)
-    img = ImageEnhance.Contrast(img).enhance(1.2)
+    try:
+        img = Image.open(raw_frame).convert("RGBA").resize((1280, 720), Image.Resampling.LANCZOS)
+    except Exception:
+        img = Image.new("RGBA", (1280, 720), (15, 15, 25, 255))
+
+    img = ImageEnhance.Color(img).enhance(1.40)
+    img = ImageEnhance.Contrast(img).enhance(1.25)
 
     overlay = Image.new("RGBA", (1280, 720), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
     accent = GAME_CONFIG[game_key]["accent_color"]
-    draw.rectangle([0, 480, 1280, 720], fill=(10, 10, 16, 215))
-    draw.rectangle([0, 0, 1280, 720], outline=accent + (255,), width=14)
-    draw.rectangle([40, 455, 440, 505], fill=accent + (255,))
+    # Bottom dark gradient box & outer neon border
+    draw.rectangle([0, 465, 1280, 720], fill=(8, 8, 14, 230))
+    draw.rectangle([0, 0, 1280, 720], outline=accent + (255,), width=16)
+
+    # Top-Right Viral Shock Badge (Bright Yellow with Black text for maximum CTR)
+    shock_clean = re.sub(r"[^A-Za-z0-9 !?]", "", shock_tag).strip().upper()[:22] or "MUST WATCH!"
+    draw.rectangle([760, 35, 1245, 115], fill=(255, 215, 0, 255), outline=(0, 0, 0, 255), width=4)
+
+    # Mid-left Game Mode Tag
+    draw.rectangle([40, 440, 480, 495], fill=accent + (255,))
 
     try:
-        font_tag = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 30)
-        font_main = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 58)
+        font_shock = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
+        font_tag = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 28)
+        font_main = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 60)
     except Exception:
+        font_shock = ImageFont.load_default()
         font_tag = ImageFont.load_default()
         font_main = ImageFont.load_default()
 
+    draw.text((785, 53), shock_clean, font=font_shock, fill=(10, 10, 10, 255))
+
     tag_text = "FINAL CIRCLE & HIGHLIGHTS" if GAME_CONFIG[game_key]["type"] == "battle_royale" else "FULL MATCH HIGHLIGHTS"
-    draw.text((55, 463), tag_text[:24], font=font_tag, fill=(255, 255, 255, 255))
-    draw.text((45, 535), headline.upper()[:34], font=font_main, fill=(255, 255, 255, 255))
-    draw.text((45, 615), GAME_CONFIG[game_key]["name"].upper(), font=font_main, fill=accent + (255,))
+    draw.text((55, 452), tag_text[:24], font=font_tag, fill=(255, 255, 255, 255))
+    draw.text((45, 520), headline.upper()[:32], font=font_main, fill=(255, 255, 255, 255))
+    draw.text((45, 605), GAME_CONFIG[game_key]["name"].upper(), font=font_main, fill=(255, 230, 0, 255))
 
     combined = Image.alpha_composite(img, overlay).convert("RGB")
-    combined.save(out_jpg.resolve(), "JPEG", quality=92)
-    print(f"[+] Generated Custom Thumbnail: {out_jpg.name}", flush=True)
+    combined.save(out_jpg.resolve(), "JPEG", quality=94)
+    print(f"[+] Generated Viral Custom Thumbnail: {out_jpg.name}", flush=True)
 
 
 def format_ass_time(seconds: float) -> str:
@@ -663,9 +710,88 @@ def format_ass_time(seconds: float) -> str:
     return f"{hrs}:{mins:02d}:{secs:05.2f}"
 
 
-def render_9x16_short(source_vod: Path, short_window: tuple[float, float], game_key: str, banner_title: str, whisper_model: WhisperModel, out_mp4: Path):
-    start_sec, end_sec = short_window
+def translate_and_polish_subtitles_to_english(raw_chunks: list[dict], game_name: str, model_name: str) -> list[dict]:
+    """
+    Guarantees 100% natural, hype English esports subtitles even if the source audio
+    was Korean, Japanese, Spanish, Portuguese, French, Russian, or noisy commentary.
+    """
+    if not raw_chunks:
+        return []
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return raw_chunks
+
+    try:
+        client = genai.Client(api_key=api_key)
+        lines_payload = [{"i": idx, "t": c["text"]} for idx, c in enumerate(raw_chunks)]
+        prompt = (
+            f"You are an expert {game_name} esports translator and subtitle editor. "
+            "Below is a JSON list of short subtitle phrases from a gaming clip. "
+            "If any phrase is not in English, or is broken/mistranscribed speech, translate and polish it into natural, punchy ENGLISH esports commentary (keep each item 2 to 4 words max, ALL CAPS). "
+            "If it is already good English, keep it punchy and ALL CAPS. "
+            "Return ONLY raw JSON array of objects with 'i' and 't':\n"
+            f"{json.dumps(lines_payload, ensure_ascii=False)}"
+        )
+        resp = client.models.generate_content(model=model_name, contents=prompt)
+        parsed = json.loads(re.sub(r"^```json|```$", "", resp.text.strip(), flags=re.MULTILINE).strip())
+        mapping = {int(item["i"]): str(item["t"]).upper().strip() for item in parsed if "i" in item and "t" in item}
+        for idx, c in enumerate(raw_chunks):
+            if idx in mapping and mapping[idx]:
+                c["text"] = mapping[idx]
+    except Exception as e:
+        print(f"[!] Subtitle Gemini English polish note: {e}", flush=True)
+
+    return raw_chunks
+
+
+def build_hormozi_ass_events(raw_chunks: list[dict], clip_dur: float) -> list[str]:
+    """
+    Creates Hormozi-style active word pop-ups where the currently spoken word scales up (118%)
+    and highlights in bright yellow (&H0000FFFF&) while surrounding words in the 3-word chunk stay crisp white.
+    """
+    events = []
+    for chunk in raw_chunks:
+        s_t = max(0.0, float(chunk["start"]))
+        e_t = min(clip_dur, float(chunk["end"]))
+        if e_t <= s_t:
+            continue
+        clean_phrase = re.sub(r"[{}\\]", "", chunk["text"]).strip().upper()
+        words = [w for w in clean_phrase.split() if w]
+        if not words:
+            continue
+
+        total_dur = max(0.15, e_t - s_t)
+        word_step = total_dur / len(words)
+
+        for w_idx in range(len(words)):
+            w_start = s_t + (w_idx * word_step)
+            w_end = s_t + ((w_idx + 1) * word_step) if w_idx < len(words) - 1 else e_t
+            formatted_words = []
+            for j, word_str in enumerate(words):
+                if j == w_idx:
+                    # Active word: Neon Yellow + 118% Pop Scale
+                    formatted_words.append(r"{\c&H0000FFFF&\fscx118\fscy118}" + word_str + r"{\c&H00FFFFFF&\fscx100\fscy100}")
+                else:
+                    formatted_words.append(word_str)
+            line_text = " ".join(formatted_words)
+            events.append(f"Dialogue: 2,{format_ass_time(w_start)},{format_ass_time(w_end)},WordSub,,0,0,0,,{line_text}")
+
+    return events
+
+
+def render_9x16_short(
+    source_vod: Path,
+    short_item: dict,
+    game_key: str,
+    banner_title: str,
+    whisper_model: WhisperModel,
+    active_model: str,
+    out_mp4: Path
+):
+    start_sec, end_sec = float(short_item["start"]), float(short_item["end"])
+    hook_text = str(short_item.get("hook") or "WAIT FOR THE CLUTCH!").upper()
     clip_dur = round(min(58.0, max(30.0, end_sec - start_sec)), 2)
+
     raw_clip = (WORK_DIR / "short_raw.mp4").resolve()
     wav_clip = (WORK_DIR / "short_audio.wav").resolve()
     ass_file = (WORK_DIR / "subtitles.ass").resolve()
@@ -681,7 +807,52 @@ def render_9x16_short(source_vod: Path, short_window: tuple[float, float], game_
         "ffmpeg", "-y", "-i", str(raw_clip), "-vn", "-ac", "1", "-ar", "16000", str(wav_clip)
     ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=True)
 
-    segments_gen, _ = whisper_model.transcribe(str(wav_clip), word_timestamps=True)
+    # task="translate" forces Whisper to translate any non-English speech directly into English!
+    segments_gen, info = whisper_model.transcribe(
+        str(wav_clip),
+        task="translate",
+        word_timestamps=True,
+        beam_size=5
+    )
+    detected_lang = getattr(info, "language", "en")
+    print(f"    [*] Audio language detected: '{detected_lang}' -> Translating/Rendering in 100% English", flush=True)
+
+    raw_chunks = []
+    for seg in segments_gen:
+        if seg.words:
+            chunk = []
+            for w in seg.words:
+                chunk.append(w)
+                if len(chunk) == 3:
+                    raw_chunks.append({
+                        "start": max(0.0, chunk[0].start),
+                        "end": min(clip_dur, chunk[-1].end),
+                        "text": " ".join(x.word.strip() for x in chunk)
+                    })
+                    chunk = []
+            if chunk:
+                raw_chunks.append({
+                    "start": max(0.0, chunk[0].start),
+                    "end": min(clip_dur, chunk[-1].end),
+                    "text": " ".join(x.word.strip() for x in chunk)
+                })
+        elif seg.text.strip():
+            # Fallback if a translated segment doesn't emit word-level splits
+            words = seg.text.strip().split()
+            seg_dur = max(0.5, seg.end - seg.start)
+            num_groups = max(1, (len(words) + 2) // 3)
+            step = seg_dur / num_groups
+            for g_idx in range(num_groups):
+                grp = words[g_idx * 3:(g_idx + 1) * 3]
+                raw_chunks.append({
+                    "start": max(0.0, seg.start + g_idx * step),
+                    "end": min(clip_dur, seg.start + (g_idx + 1) * step),
+                    "text": " ".join(grp)
+                })
+
+    # Run Gemini English verification & esports slang polish
+    raw_chunks = translate_and_polish_subtitles_to_english(raw_chunks, GAME_CONFIG[game_key]["name"], active_model)
+
     ass_header = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -689,37 +860,34 @@ PlayResY: 1920
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: TopBanner,DejaVu Sans,52,&H00FFFFFF,&H000000FF,&H00000000,&H96000000,-1,0,0,0,100,100,0,0,3,16,0,8,40,40,170,1
-Style: WordSub,DejaVu Sans,68,&H0000FFFF,&H00FFFFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,6,3,2,60,60,310,1
+Style: TopBanner,DejaVu Sans,50,&H00FFFFFF,&H000000FF,&H00000000,&HAA000000,-1,0,0,0,100,100,0,0,3,16,0,8,40,40,165,1
+Style: HookBanner,DejaVu Sans,56,&H0000FFFF,&H000000FF,&H00000000,&HCC000000,-1,0,0,0,100,100,0,0,3,14,0,8,40,40,340,1
+Style: WordSub,DejaVu Sans,70,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,7,4,2,60,60,330,1
+Style: Watermark,DejaVu Sans,30,&H80FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,2,0,1,3,1,2,40,40,185,1
+Style: SubscribeCTA,DejaVu Sans,46,&H00FFFFFF,&H0000FFFF,&H00000000,&HD80000FF,-1,0,0,0,100,100,0,0,3,18,0,2,40,40,115,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
-    clean_banner = re.sub(r"[^A-Za-z0-9 vsVS!\-&]", "", banner_title).strip()[:36]
+    clean_banner = re.sub(r"[^A-Za-z0-9 vsVS!\-&]", "", banner_title).strip()[:34]
+    clean_hook = re.sub(r"[^A-Za-z0-9 !?\-]", "", hook_text).strip()[:32]
+    cta_start = max(3.5, clip_dur - 3.5)
+
     events = [
-        f"Dialogue: 0,0:00:00.00,{format_ass_time(clip_dur)},TopBanner,,0,0,0,,{GAME_CONFIG[game_key]['name'].upper()}\\N{clean_banner}"
+        # Permanent Top Match Header
+        f"Dialogue: 0,0:00:00.00,{format_ass_time(clip_dur)},TopBanner,,0,0,0,,{GAME_CONFIG[game_key]['name'].upper()}\\N{clean_banner}",
+        # First 3.2s High-Retention Hook Banner
+        f"Dialogue: 1,0:00:00.00,{format_ass_time(min(3.2, clip_dur))},HookBanner,,0,0,0,,🔥 {clean_hook}",
+        # Subtle Brand Watermark
+        f"Dialogue: 0,0:00:00.00,{format_ass_time(cta_start)},Watermark,,0,0,0,,@THERIPPERSGAMING",
+        # Final 3.5s Subscribe & Follow CTA Popup
+        f"Dialogue: 3,{format_ass_time(cta_start)},{format_ass_time(clip_dur)},SubscribeCTA,,0,0,0,,SUBSCRIBE & FOLLOW @THERIPPERSGAMING\\NFOR DAILY PRO HIGHLIGHTS!"
     ]
 
-    for seg in segments_gen:
-        if not seg.words:
-            continue
-        chunk = []
-        for w in seg.words:
-            chunk.append(w)
-            if len(chunk) == 3:
-                s_t = format_ass_time(max(0.0, chunk[0].start))
-                e_t = format_ass_time(min(clip_dur, chunk[-1].end))
-                txt = re.sub(r"[{}\\]", "", " ".join(x.word.strip().upper() for x in chunk))
-                events.append(f"Dialogue: 1,{s_t},{e_t},WordSub,,0,0,0,,{txt}")
-                chunk = []
-        if chunk:
-            s_t = format_ass_time(max(0.0, chunk[0].start))
-            e_t = format_ass_time(min(clip_dur, chunk[-1].end))
-            txt = re.sub(r"[{}\\]", "", " ".join(x.word.strip().upper() for x in chunk))
-            events.append(f"Dialogue: 1,{s_t},{e_t},WordSub,,0,0,0,,{txt}")
-
+    events.extend(build_hormozi_ass_events(raw_chunks, clip_dur))
     ass_file.write_text(ass_header + "\n".join(events) + "\n", encoding="utf-8")
 
+    # Full 16:9 HUD preserved (1080:-2) over blurred background
     vf_complex = (
         "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5[bg];"
         "[0:v]scale=1080:-2:force_original_aspect_ratio=decrease[fg];"
@@ -733,14 +901,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         "-r", "30", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2",
         str(out_mp4_abs)
-    ], cwd=str(WORK_DIR.resolve()), timeout=180, check=True)
-    print(f"[+] Rendered 9:16 Subtitled Short ({start_sec}s -> {end_sec}s): {out_mp4_abs.name}", flush=True)
+    ], cwd=str(WORK_DIR.resolve()), timeout=240, check=True)
+    print(f"[+] Rendered 9:16 English Subtitled Short ({start_sec}s -> {end_sec}s): {out_mp4_abs.name}", flush=True)
 
 
 # ==============================================================================
-# 6. GEMINI AI SEO METADATA GENERATOR
+# 6. GEMINI AI ENGLISH SEO & VIRAL METADATA GENERATOR
 # ==============================================================================
-def generate_seo_metadata(vod_title: str, game_key: str, model_name: str) -> dict:
+def generate_seo_metadata(vod_title: str, game_key: str, short_windows: list[dict], model_name: str) -> dict:
     game_info = GAME_CONFIG[game_key]
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     is_br = game_info["type"] == "battle_royale"
@@ -749,15 +917,28 @@ def generate_seo_metadata(vod_title: str, game_key: str, model_name: str) -> dic
         f"{vod_title[:55]} | FINAL CIRCLE & BEST FIGHTS ({game_info['name']})"
         if is_br else f"{vod_title[:60]} | FULL MATCH HIGHLIGHTS ({game_info['name']})"
     )
+    fallback_shorts = []
+    for idx, sw in enumerate(short_windows):
+        hk = sw.get("hook", "INSANE CLUTCH!")
+        fallback_shorts.append({
+            "yt_title": f"{hk} | {game_info['name']} Pro Highlight #Shorts",
+            "caption": (
+                f"🔥 {hk} Rate this play 1-10 in the comments! 👇\n"
+                f"Follow @TheRippersGaming for daily pro esports highlights!\n\n"
+                f"{game_info['hashtags']} #Shorts #TheRippersGaming"
+            )
+        })
+
     fallback_data = {
-        "match_headline": vod_title[:32],
+        "match_headline": vod_title[:28].upper(),
+        "thumb_shock_tag": "INSANE MATCH!",
         "yt_title": fallback_title[:98],
         "yt_description": (
-            f"{vod_title} - Full {game_info['name']} Tournament Match Recap & Highlights!\n\n"
-            f"Watch the best teamfights, clutches, and final moments from {game_info['name']} esports.\n\n"
-            f"{game_info['hashtags']} #TheRippersGaming"
+            f"🔥 Subscribe to The Rippers Gaming for daily {game_info['name']} pro tournament recaps & highlights!\n\n"
+            f"Watch the complete high-action match recap, best clutches, and final moments from {vod_title}.\n\n"
+            f"{game_info['hashtags']} #Esports #TheRippersGaming"
         ),
-        "short_caption": f"INSANE {game_info['name']} Tournament Moment! 🔥 {game_info['hashtags']} #TheRippersGaming"
+        "shorts_meta": fallback_shorts
     }
 
     if not api_key:
@@ -765,14 +946,22 @@ def generate_seo_metadata(vod_title: str, game_key: str, model_name: str) -> dic
 
     try:
         client = genai.Client(api_key=api_key)
-        prompt = (
-            f"Source VOD Title: '{vod_title}' | Game: {game_info['name']} ({game_info['type']}). "
-            "Return ONLY raw JSON with keys: "
-            "'match_headline' (e.g. 'SENTINELS vs FNATIC' or 'ALGS GRAND FINALS', max 28 chars), "
-            "'yt_title' (high-CTR YouTube title under 95 chars; mention 'FINAL CIRCLE & BEST FIGHTS' if battle_royale else 'FULL HIGHLIGHTS & ALL ROUNDS'), "
-            "'yt_description' (2-paragraph SEO esports description with hashtags), "
-            "'short_caption' (hype 1-line vertical video caption with 4 hashtags)."
-        )
+        hooks_list = [sw.get("hook", "INSANE PLAY") for sw in short_windows]
+        prompt = f"""
+Source VOD Title: '{vod_title}' | Game: {game_info['name']} ({game_info['type']}).
+Short Hooks extracted: {json.dumps(hooks_list)}
+
+IMPORTANT: Even if the Source VOD Title is in Korean, Japanese, Spanish, Portuguese, French, or Russian, ALL output fields MUST be translated into 100% natural, viral ENGLISH!
+
+Return ONLY raw valid JSON with keys:
+- "match_headline": Clean English team matchup or tournament stage (e.g. "T1 vs GENG - GRAND FINALS" or "ALGS FINALS", max 28 chars).
+- "thumb_shock_tag": 2-to-3 word viral shock badge for the thumbnail in ALL CAPS (e.g. "UNREAL COMEBACK!", "INSANE FINAL CIRCLE!", "200 IQ CLUTCH!").
+- "yt_title": High-CTR English YouTube title under 95 chars (include 'FINAL CIRCLE & BEST FIGHTS' if battle_royale else 'FULL MATCH HIGHLIGHTS').
+- "yt_description": Engaging 2-paragraph English SEO description with a question asking viewers to comment their favorite moment + hashtags.
+- "shorts_meta": Array of {len(hooks_list)} objects (one for each Short hook), each having:
+    - "yt_title": Curiosity-gap English YouTube Short title under 90 chars ending with #Shorts (NO '#1' or '#2' numbering!).
+    - "caption": Viral Instagram/Facebook/YouTube Short caption starting with a hype hook, a comment-bait question (e.g. 'Was this a 200 IQ play or a throw? 👇'), a call-to-action to follow @TheRippersGaming, and 5 trending hashtags.
+"""
         resp = client.models.generate_content(model=model_name, contents=prompt)
         raw_text = re.sub(r"^```json|```$", "", resp.text.strip(), flags=re.MULTILINE).strip()
         parsed = json.loads(raw_text)
@@ -783,7 +972,7 @@ def generate_seo_metadata(vod_title: str, game_key: str, model_name: str) -> dic
 
 
 # ==============================================================================
-# 7. MULTI-PLATFORM PUBLISHERS (YOUTUBE + PLAYLISTS, FB PAGE, FB REELS, IG REELS)
+# 7. MULTI-PLATFORM PUBLISHERS (WITH QUOTA-SAFE YOUTUBE FALLBACK)
 # ==============================================================================
 def get_youtube_client():
     cid = os.environ.get("YT_CLIENT_ID", "").strip()
@@ -884,7 +1073,11 @@ def upload_youtube_video(youtube, video_path: Path, title: str, description: str
 
         return vid_id
     except Exception as e:
-        print(f"[-] YouTube Upload Error: {e}", flush=True)
+        err_str = str(e)
+        if "uploadLimitExceeded" in err_str:
+            print("[!] YouTube Daily Upload Limit Reached! Skipping YT upload so FB & IG Reels can still publish.", flush=True)
+        else:
+            print(f"[-] YouTube Upload Error: {e}", flush=True)
         return None
 
 
@@ -1038,18 +1231,28 @@ def main():
     vod_title = info.get("title", f"{GAME_CONFIG[game_key]['name']} Pro Tournament Match")
     print(f"[+] Downloaded Match Video: {vod_title} ({vod_id})", flush=True)
 
-    # 2. Extract AI-Verified Highlights (with Auto-Detected Gemini Model + Disk Fallback)
+    # 2. Extract AI-Verified Highlights & Unique Short Hooks
     segments, short_windows, active_model = get_ai_highlight_segments(vod_path, game_key)
 
-    # 3. Generate Gemini SEO Metadata
-    seo = generate_seo_metadata(vod_title, game_key, active_model)
+    # 3. Generate Viral English SEO Metadata
+    seo = generate_seo_metadata(vod_title, game_key, short_windows[:shorts_count], active_model)
 
-    # 4. Render 16:9 Full Recap & Custom Thumbnail
+    # 4. Render 16:9 Full Recap (with Auto-Chapters) & Viral Custom Thumbnail
     recap_mp4 = (WORK_DIR / "final_recap_16x9.mp4").resolve()
     thumb_jpg = (WORK_DIR / "custom_thumb.jpg").resolve()
-    render_16x9_recap(vod_path, segments, recap_mp4)
-    thumb_timestamp = (short_windows[0][0] + short_windows[0][1]) / 2.0 if short_windows else 45.0
-    generate_custom_thumbnail(vod_path, thumb_timestamp, game_key, seo["match_headline"], thumb_jpg)
+    chapters_str = render_16x9_recap(vod_path, segments, recap_mp4, game_key)
+
+    thumb_timestamp = (short_windows[0]["start"] + short_windows[0]["end"]) / 2.0 if short_windows else 45.0
+    generate_custom_thumbnail(
+        source_vod=vod_path,
+        thumb_sec=thumb_timestamp,
+        game_key=game_key,
+        headline=seo["match_headline"],
+        shock_tag=seo.get("thumb_shock_tag", "INSANE MATCH!"),
+        out_jpg=thumb_jpg
+    )
+
+    full_yt_description = f"{seo['yt_description']}\n\n⏱️ MATCH CHAPTERS:\n{chapters_str}\n"
 
     # 5. Upload 16:9 Recap to YouTube + Auto-Sort into Game Playlist + Share on Facebook Page
     youtube = get_youtube_client()
@@ -1058,29 +1261,42 @@ def main():
         youtube=youtube,
         video_path=recap_mp4,
         title=seo["yt_title"],
-        description=seo["yt_description"],
+        description=full_yt_description,
         thumb_path=thumb_jpg,
         playlist_id=playlist_id
     )
     if yt_recap_id:
         post_youtube_link_to_facebook_page(yt_recap_id, seo["yt_title"])
 
-    # 6. Render & Distribute 9:16 Vertical Shorts (YouTube Shorts, FB Reels, IG Reels)
-    print("[*] Loading faster-whisper model for word-by-word Short subtitles...", flush=True)
-    whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+    # 6. Render & Distribute 9:16 Vertical Shorts (100% English Translated + Hormozi Subtitles)
+    print("[*] Loading faster-whisper ('small' multilingual-to-English model)...", flush=True)
+    whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
 
-    for idx, s_window in enumerate(short_windows[:shorts_count]):
+    shorts_meta_list = seo.get("shorts_meta", [])
+    for idx, s_item in enumerate(short_windows[:shorts_count]):
         short_mp4 = (WORK_DIR / f"short_{idx+1}.mp4").resolve()
-        render_9x16_short(vod_path, s_window, game_key, seo["match_headline"], whisper_model, short_mp4)
+        render_9x16_short(
+            source_vod=vod_path,
+            short_item=s_item,
+            game_key=game_key,
+            banner_title=seo["match_headline"],
+            whisper_model=whisper_model,
+            active_model=active_model,
+            out_mp4=short_mp4
+        )
 
-        short_title = f"{seo['match_headline']} - Insane {GAME_CONFIG[game_key]['name']} Highlight #{idx+1} #Shorts"
-        short_caption = seo["short_caption"]
+        if idx < len(shorts_meta_list):
+            short_title = shorts_meta_list[idx].get("yt_title", f"{s_item['hook']} | {GAME_CONFIG[game_key]['name']} #Shorts")
+            short_caption = shorts_meta_list[idx].get("caption", f"🔥 {s_item['hook']} #Shorts")
+        else:
+            short_title = f"{s_item['hook']} | {GAME_CONFIG[game_key]['name']} Pro Highlight #Shorts"
+            short_caption = f"🔥 {s_item['hook']} Rate this play 1-10! 👇\n\n{GAME_CONFIG[game_key]['hashtags']} #Shorts #TheRippersGaming"
 
         upload_youtube_video(
             youtube=youtube,
             video_path=short_mp4,
             title=short_title[:99],
-            description=f"{short_caption}\n\nFull Match Recap on our channel!",
+            description=f"{short_caption}\n\n📺 Watch the Full Match Recap on our channel!",
             thumb_path=None,
             playlist_id=playlist_id
         )
