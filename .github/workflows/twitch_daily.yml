@@ -5,6 +5,10 @@ on:
     - cron: '0 11,17 * * *' # Runs twice daily at 11:00 UTC (4:00 PM PKT) and 17:00 UTC (10:00 PM PKT)
   workflow_dispatch:
 
+concurrency:
+  group: repo-git-sync
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -58,4 +62,10 @@ jobs:
         run: |
           rm -rf ig_stage/
           git add -A ig_stage/ processed_twitch_clips.txt 2>/dev/null || true
-          git diff --staged --quiet || (git commit -m "chore: update processed twitch clips [skip ci]" && git push)
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: update processed twitch clips [skip ci]"
+            for i in 1 2 3; do
+              git pull --rebase -X ours origin ${{ github.ref_name }} && git push origin HEAD:${{ github.ref_name }} && break
+              sleep 5
+            done
+          fi
