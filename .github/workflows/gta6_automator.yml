@@ -1,0 +1,104 @@
+name: GTA 6 Twitch Giants Viral Clipper & Daily Compilation
+
+on:
+  schedule:
+    - cron: '30 */4 * * *' # 9:16 Vertical Shorts/Reels every 4 hours
+    - cron: '0 15 * * *'   # 16:9 Widescreen Daily Compilation once a day at 15:00 UTC (8:00 PM PKT)
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: 'Select Mode to Run Manually'
+        required: false
+        default: 'shorts_9x16'
+        type: choice
+        options:
+          - shorts_9x16
+          - compilation_16x9
+          - both
+      clips_count:
+        description: 'Number of 9:16 Shorts to publish (when running shorts)'
+        required: false
+        default: '2'
+        type: string
+
+concurrency:
+  group: repo-git-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish_gta6_content:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install FFmpeg & Fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-liberation fonts-dejavu-core
+
+      - name: Configure Git for Instagram Staging & State Tracking
+        run: |
+          git config --local user.email "actions@github.com"
+          git config --local user.name "Esports Automator Bot"
+
+      - name: Install Python Packages
+        run: |
+          pip install --upgrade pip
+          pip install "yt-dlp[default,curl-cffi]" faster-whisper requests pillow google-genai
+          pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
+
+      - name: Run 9:16 GTA 6 Shorts Clipper (Every 4 Hours or Manual)
+        if: github.event.schedule == '30 */4 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.run_mode == 'shorts_9x16' || inputs.run_mode == 'both'))
+        env:
+          PYTHONUNBUFFERED: '1'
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          CLIPS_COUNT: ${{ inputs.clips_count || '2' }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+        run: |
+          python3 gta6_giants_automator.py
+
+      - name: Run 16:9 GTA 6 Daily Compilation (Once Daily or Manual)
+        if: github.event.schedule == '0 15 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.run_mode == 'compilation_16x9' || inputs.run_mode == 'both'))
+        env:
+          PYTHONUNBUFFERED: '1'
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+        run: |
+          python3 gta6_daily_compilation.py
+
+      - name: Clean Up Temporary IG Files & Commit Processed GTA 6 Records
+        if: always()
+        run: |
+          rm -rf ig_stage/
+          git add -A ig_stage/ processed_gta6_clips.txt processed_gta6_comp_clips.txt playlists.json 2>/dev/null || true
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: update processed GTA 6 records [skip ci]"
+            for i in 1 2 3; do
+              git pull --rebase -X ours origin ${{ github.ref_name }} && git push origin HEAD:${{ github.ref_name }} && break
+              sleep 5
+            done
+          fi
