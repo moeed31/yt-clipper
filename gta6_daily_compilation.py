@@ -21,7 +21,6 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from PIL import Image, ImageDraw, ImageEnhance, ImageFont, ImageStat
 
-# Ensure chronological logs in GitHub Actions
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 
@@ -31,8 +30,7 @@ if hasattr(sys.stdout, "reconfigure"):
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_MODELS = [
     os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite").strip(),
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
+    "gemini-3.8-flash",
 ]
 
 TWITCH_CLIENT_ID = os.environ.get("TWITCH_CLIENT_ID", "").strip()
@@ -50,9 +48,17 @@ STATE_FILE = Path("processed_gta6_comp_clips.txt")
 LOGO_PATH = Path("logo.png")
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
+# Auto-link-proof endpoint constants
+GOOGLE_TOKEN_URI = "https://" "[oauth2.googleapis.com/token](https://oauth2.googleapis.com/token)"
+TWITCH_TOKEN_URI = "https://" "id.twitch.tv/oauth2/token"
+TWITCH_HELIX_BASE = "https://" "api.twitch.tv/helix"
+TWITCH_GQL_URI = "https://" "gql.twitch.tv/gql"
+TWITCH_CLIP_BASE = "https://" "clips.twitch.tv/"
+GRAPH_VIDEO_FB_BASE = "https://" "[graph-video.facebook.com/v21.0](https://graph-video.facebook.com/v21.0)"
+
 TARGET_MIN_CLIPS = 5
 TARGET_MAX_CLIPS = 10
-TARGET_MAX_TOTAL_SEC = 480  # ~8 minutes ideal for retention & mid-roll eligibility
+TARGET_MAX_TOTAL_SEC = 480
 
 HARD_PROFANITY_PATTERNS = [
     r"\bfuck(?:ing|ed|er|s)?\b",
@@ -168,7 +174,7 @@ def fetch_gta6_clips(processed: set) -> List[Dict]:
     if TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET:
         try:
             tok = requests.post(
-                "[https://id.twitch.tv/oauth2/token](https://id.twitch.tv/oauth2/token)",
+                TWITCH_TOKEN_URI,
                 params={
                     "client_id": TWITCH_CLIENT_ID,
                     "client_secret": TWITCH_CLIENT_SECRET,
@@ -179,7 +185,7 @@ def fetch_gta6_clips(processed: set) -> List[Dict]:
             if tok:
                 headers = {"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {tok}"}
                 g = requests.get(
-                    "[https://api.twitch.tv/helix/games](https://api.twitch.tv/helix/games)",
+                    f"{TWITCH_HELIX_BASE}/games",
                     headers=headers,
                     params={"name": "Grand Theft Auto VI"},
                     timeout=15,
@@ -187,7 +193,7 @@ def fetch_gta6_clips(processed: set) -> List[Dict]:
                 if g:
                     started_at = datetime.fromtimestamp(time.time() - 72 * 3600, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                     c = requests.get(
-                        "[https://api.twitch.tv/helix/clips](https://api.twitch.tv/helix/clips)",
+                        f"{TWITCH_HELIX_BASE}/clips",
                         headers=headers,
                         params={"game_id": g[0]["id"], "first": 50, "started_at": started_at},
                         timeout=20,
@@ -224,7 +230,7 @@ def fetch_gta6_clips(processed: set) -> List[Dict]:
         for period in ("LAST_DAY", "LAST_WEEK"):
             try:
                 r = requests.post(
-                    "[https://gql.twitch.tv/gql](https://gql.twitch.tv/gql)",
+                    TWITCH_GQL_URI,
                     headers=headers,
                     json={"query": query, "variables": {"gameName": "Grand Theft Auto VI", "limit": 50, "filter": period}},
                     timeout=20,
@@ -238,7 +244,7 @@ def fetch_gta6_clips(processed: set) -> List[Dict]:
                     bc = node.get("broadcaster") or {}
                     clips.append({
                         "id": slug,
-                        "url": node.get("url") or f"[https://clips.twitch.tv/](https://clips.twitch.tv/){slug}",
+                        "url": node.get("url") or f"{TWITCH_CLIP_BASE}{slug}",
                         "title": node.get("title", ""),
                         "broadcaster": bc.get("displayName") or bc.get("login") or "Streamer",
                         "views": int(node.get("viewCount", 0) or 0),
@@ -286,7 +292,7 @@ def download_clip(url: str, out_path: Path) -> bool:
 
 
 # ==============================================================================
-# GEMINI AI FILTERING & COMPILATION PACKAGING
+# GEMINI AI FILTERING & COMPILATION PACKAGING (WITH 503 BACKOFF + 3.8 FALLBACK)
 # ==============================================================================
 def parse_json_safely(raw_text: str) -> Dict:
     text = (raw_text or "").strip()
@@ -300,22 +306,32 @@ def call_gemini_json(prompt: str) -> Optional[Dict]:
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is missing.")
     client = genai.Client(api_key=GEMINI_API_KEY)
+    last_err = None
+
     for model_name in dict.fromkeys(GEMINI_MODELS):
         if not model_name:
             continue
-        try:
-            resp = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.4,
-                ),
-            )
-            return parse_json_safely(resp.text)
-        except Exception as e:
-            print(f"[Gemini {model_name}] Error: {e}")
-            time.sleep(2)
+        for attempt in range(1, 4):
+            try:
+                resp = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.4,
+                    ),
+                )
+                return parse_json_safely(resp.text)
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                print(f"[Gemini] {model_name} (try {attempt}/3) failed: {e}")
+                if any(code in err_str for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")):
+                    time.sleep(4 * attempt)
+                    continue
+                break
+
+    print(f"[Gemini] All models failed: {last_err}")
     return None
 
 
@@ -334,11 +350,13 @@ def score_clips_batch(clips_with_transcripts: List[Dict]) -> Optional[Dict]:
     prompt = f"""
 You are the lead YouTube strategist for "The Rippers Gaming" (strictly GTA 6 / Grand Theft Auto VI).
 
+CRITICAL FACT: Today is November 2026. Grand Theft Auto VI (GTA 6) IS OFFICIALLY RELEASED and streamers are actively playing real GTA 6 gameplay live on Twitch right now. NEVER reject a clip by claiming GTA 6 is unreleased.
+
 Review these candidate Twitch clips for today's 16:9 Daily GTA 6 Compilation:
 {json.dumps(items_summary, indent=2)}
 
 STRICT RULES:
-1. Select ONLY genuine GTA 6 gameplay or authentic GTA 6 reactions (relevance >= 7/10). Reject off-topic clips (other games, food/fasting, random drama, silent/boring clips).
+1. Select ONLY genuine GTA 6 gameplay, Vice City/Leonida moments, Jason/Lucia reactions, funny glitches, or authentic GTA 6 streamer reactions. Reject off-topic clips (other games, food/fasting, politics/drama, overly NSFW clips).
 2. CRITICAL: The FIRST clip in selected_clips MUST have ZERO profanity (profanity_hits == 0) AND be the single most exciting hook.
 3. Exclude any clip with heavy profanity (profanity_hits >= 3).
 4. Pick between {TARGET_MIN_CLIPS} and {TARGET_MAX_CLIPS} unique clips, ordered for maximum retention.
@@ -411,7 +429,6 @@ def standardize_clip_16x9(
     intro_vo_path: Optional[Path] = None,
     intro_vo_dur: float = 0.0,
 ) -> float:
-    """Normalizes clip to uniform 1080p30 stereo H.264/AAC for seamless -c copy concat."""
     dur, has_audio = probe_video(raw_mp4)
     badge_file = workdir / f"badge_{out_mp4.stem}.txt"
     badge_text = f"{strip_non_ascii(broadcaster).upper()[:18]}  |  {strip_non_ascii(chapter_title)[:32]}"
@@ -479,7 +496,6 @@ def standardize_clip_16x9(
 
 
 def build_high_ctr_thumbnail(first_clip_path: Path, thumb_text: str, out_jpg: Path, workdir: Path) -> bool:
-    """Selects sharpest/brightest frame from Clip #1 and builds a 1280x720 high-CTR thumbnail."""
     frames_dir = workdir / "frames"
     frames_dir.mkdir(exist_ok=True)
     run_cmd([
@@ -558,7 +574,7 @@ def upload_compilation_youtube(
     creds = Credentials(
         token=None,
         refresh_token=YT_REFRESH_TOKEN,
-        token_uri="https://oauth2.googleapis.com/token",
+        token_uri=GOOGLE_TOKEN_URI,
         client_id=YT_CLIENT_ID,
         client_secret=YT_CLIENT_SECRET,
     )
@@ -582,7 +598,7 @@ def upload_compilation_youtube(
     media = MediaFileUpload(str(video_path), chunksize=8 * 1024 * 1024, resumable=True, mimetype="video/mp4")
     resp = yt.videos().insert(part="snippet,status", body=body, media_body=media).execute()
     vid_id = resp.get("id")
-    print(f"[YouTube] Published Compilation: https://youtu.be/{vid_id}")
+    print(f"[YouTube] Published Compilation ID: {vid_id}")
 
     if vid_id and thumb_path and thumb_path.exists():
         try:
@@ -602,7 +618,7 @@ def upload_compilation_facebook(video_path: Path, title: str, description: str) 
     try:
         with video_path.open("rb") as f:
             r = requests.post(
-                f"https://graph-video.facebook.com/v21.0/{FB_PAGE_ID}/videos",
+                f"{GRAPH_VIDEO_FB_BASE}/{FB_PAGE_ID}/videos",
                 data={
                     "title": title,
                     "description": description[:4000],
@@ -658,7 +674,6 @@ def main() -> None:
             print("[Compilation] Gemini quality gate did not find enough relevant GTA 6 clips.")
             return
 
-        # Deduplicate selections and enforce valid indices
         ordered_items: List[Tuple[Dict, str]] = []
         seen_idx = set()
         for sel in raw_selected:
@@ -672,7 +687,6 @@ def main() -> None:
             chap = strip_non_ascii(sel.get("chapter_title", clip["broadcaster"])) or clip["broadcaster"]
             ordered_items.append((clip, chap))
 
-        # Promote a zero-profanity clip to slot #1 so opening 30s + intro VO stay 100% clean
         clean_pos = next((i for i, (c, _) in enumerate(ordered_items) if c["profanity_hits"] == 0), None)
         if clean_pos is not None and clean_pos > 0:
             ordered_items.insert(0, ordered_items.pop(clean_pos))
