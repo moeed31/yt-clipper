@@ -1,586 +1,894 @@
+import asyncio
+import json
 import os
 import re
-import sys
-import json
-import time
 import shutil
 import subprocess
-import requests
+import tempfile
+import time
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
+import edge_tts
+import requests
+from faster_whisper import WhisperModel
 from google import genai
+from google.genai import types
+from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from faster_whisper import WhisperModel
 
-sys.stdout.reconfigure(line_buffering=True)
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODELS = [
+    os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite").strip(),
+    "gemini-3.8-flash",
+    "gemini-2.5-flash",
+]
 
-PROCESSED_GTA6_FILE = Path("processed_gta6_clips.txt")
-PLAYLIST_CACHE_FILE = Path("playlists.json")
-LOGO_PATH = Path("logo.png").resolve()
-WORK_DIR = Path("work_gta6").resolve()
-WORK_DIR.mkdir(parents=True, exist_ok=True)
-IG_STAGE_DIR = Path("ig_stage").resolve()
-IG_STAGE_DIR.mkdir(parents=True, exist_ok=True)
+TWITCH_CLIENT_ID = os.environ.get("TWITCH_CLIENT_ID", "").strip()
+TWITCH_CLIENT_SECRET = os.environ.get("TWITCH_CLIENT_SECRET", "").strip()
+TWITCH_GQL_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 
-# Curated Whitelist of Famous Twitch Giants
-TWITCH_GIANTS = {
-    "kaicenat", "xqc", "ibai", "caseoh_", "jynxzi", "shroud", "summit1g",
-    "lirik", "tarik", "stableronaldo", "plaqueboymax", "agent00", "fanum",
-    "dukedennis", "auronplay", "rubius", "elxokas", "illojuan", "thegrefg",
-    "spreen", "gaules", "alanzoka", "loud_coringa", "kamet0", "gotaga",
-    "hasanabi", "mizkif", "emiru", "esfandtv", "nmplol", "sodapoppin",
-    "asmongold", "moistcr1tikal", "ludwig", "cdawgva", "ironmouse",
-    "timthetatman", "nickmercs", "cloakzy", "symfuhny", "pokimane",
-    "valkyrae", "fuslie", "sykkuno"
-}
+YT_CLIENT_ID = os.environ.get("YT_CLIENT_ID", "").strip()
+YT_CLIENT_SECRET = os.environ.get("YT_CLIENT_SECRET", "").strip()
+YT_REFRESH_TOKEN = os.environ.get("YT_REFRESH_TOKEN", "").strip()
 
-NON_VIP_MIN_VIEWS = 100000
-GTA6_KEYWORDS = re.compile(r"\b(gta\s*6|gta\s*vi|gtavi|gta6|vice\s*city|leonida|lucia|jason|rockstar)\b", re.IGNORECASE)
+FB_PAGE_ID = os.environ.get("FB_PAGE_ID", "").strip()
+FB_PAGE_ACCESS_TOKEN = os.environ.get("FB_PAGE_ACCESS_TOKEN", "").strip()
+IG_USER_ID = os.environ.get("IG_USER_ID", "").strip()
+
+GITHUB_REPOSITORY = os.environ.get("GITHUB_REPOSITORY", "").strip()
+GITHUB_REF_NAME = os.environ.get("GITHUB_REF_NAME", "main").strip()
+
+STATE_FILE = Path("processed_gta6_clips.txt")
+LOGO_PATH = Path("logo.png")
+IG_STAGE_DIR = Path("ig_stage")
+
+FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+TTS_VOICE = "en-US-AndrewNeural"
+TTS_RATE = "+8%"
+
+MIN_CLIP_DURATION = 12
+MAX_CLIP_DURATION = 52
+MIN_RELEVANCE_SCORE = 7
+MIN_ENTERTAINMENT_SCORE = 6
+
+# High-engagement streamers likely playing/reacting to GTA 6
+WHITELIST_STREAMERS = [
+    "kaicenat", "xqc", "lirik", "caseoh_", "jynxzi", "summit1g",
+    "shroud", "hasanabi", "tarik", "ohnepixel", "plaqueboymax",
+    "stableronaldo", "jasontheween", "alanzoka", "ibai", "elspreen",
+    "esfandtv", "nmplol", "sodapoppin", "moistcr1tikal", "clix",
+    "zackrawrr", "emiru", "mizkif", "agent00", "fanum", "duke",
+]
+
+GTA6_KEYWORDS = [
+    "gta 6", "gta6", "gta vi", "grand theft auto 6", "grand theft auto vi",
+    "vice city", "leonida", "lucia", "jason", "rockstar",
+]
+
+HARD_PROFANITY_PATTERNS = [
+    r"\bfuck(?:ing|ed|er|s)?\b",
+    r"\bmotherfuck(?:ing|er|s)?\b",
+    r"\bshit(?:ting|ty|s)?\b",
+    r"\bbitch(?:es|ing)?\b",
+    r"\bcunt\b",
+    r"\bnigg(?:a|er)s?\b",
+]
 
 
-def load_processed_clips() -> set:
-    if not PROCESSED_GTA6_FILE.exists():
-        PROCESSED_GTA6_FILE.write_text("", encoding="utf-8")
+# ==============================================================================
+# UTILITY & TEXT SANITIZATION HELPERS
+# ==============================================================================
+def load_processed_ids(path: Path) -> set:
+    if not path.exists():
         return set()
-    return set(line.strip() for line in PROCESSED_GTA6_FILE.read_text(encoding="utf-8").splitlines() if line.strip())
+    return {line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()}
 
 
-def mark_clip_processed(clip_id: str):
-    processed = load_processed_clips()
-    if clip_id not in processed:
-        with open(PROCESSED_GTA6_FILE, "a", encoding="utf-8") as f:
+def save_processed_id(path: Path, clip_id: str) -> None:
+    existing = load_processed_ids(path)
+    if clip_id not in existing:
+        with path.open("a", encoding="utf-8") as f:
             f.write(f"{clip_id}\n")
 
 
-def fetch_gta6_giant_clips(processed: set, limit: int = 2) -> list[dict]:
-    headers = {
-        "Client-ID": "kimne78kx3ncx6brgo4mv6wki5h1ko",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0"
-    }
-
-    vip_candidates = []
-    verified_viral_candidates = []
-
-    print("[*] Scanning 40+ Famous Twitch Giants for GTA 6 clips...", flush=True)
-    for login in TWITCH_GIANTS:
-        user_query = f"""
-        {{
-          user(login: "{login}") {{
-            displayName
-            clips(first: 20, criteria: {{ period: LAST_DAY }}) {{
-              edges {{
-                node {{
-                  slug
-                  title
-                  viewCount
-                  durationSeconds
-                  url
-                  game {{
-                    name
-                  }}
-                }}
-              }}
-            }}
-          }}
-        }}
-        """
-        try:
-            r = requests.post("https://gql.twitch.tv/gql", headers=headers, json={"query": user_query}, timeout=15)
-            user_data = (r.json().get("data") or {}).get("user") or {}
-            display_name = user_data.get("displayName") or login
-            edges = (user_data.get("clips") or {}).get("edges") or []
-
-            for edge in edges:
-                node = edge.get("node") or {}
-                slug = node.get("slug")
-                if not slug or slug in processed:
-                    continue
-
-                dur = float(node.get("durationSeconds") or 30.0)
-                if not (12.0 <= dur <= 60.0):
-                    continue
-
-                views = int(node.get("viewCount") or 0)
-                title = node.get("title") or ""
-                game_name = ((node.get("game") or {}).get("name") or "").strip()
-
-                is_gta6_game = (game_name.lower() == "grand theft auto vi")
-                has_gta6_keyword = bool(GTA6_KEYWORDS.search(title))
-
-                if is_gta6_game or has_gta6_keyword:
-                    vip_candidates.append({
-                        "id": slug,
-                        "game": "Grand Theft Auto VI",
-                        "url": node.get("url") or f"https://clips.twitch.tv/{slug}",
-                        "title": title if title else f"{display_name} GTA 6 Reaction",
-                        "streamer": display_name,
-                        "views": views,
-                        "duration": dur,
-                        "tier": "VIP GIANT"
-                    })
-        except Exception:
-            continue
-
-    print("[*] Checking 'Grand Theft Auto VI' directory for VIPs or Verified 100k+ View Clips...", flush=True)
-    for period in ["LAST_DAY", "LAST_WEEK"]:
-        dir_query = f"""
-        {{
-          game(name: "Grand Theft Auto VI") {{
-            clips(first: 40, criteria: {{ period: {period}, sort: VIEWS_DESC }}) {{
-              edges {{
-                node {{
-                  slug
-                  title
-                  viewCount
-                  durationSeconds
-                  url
-                  broadcaster {{
-                    login
-                    displayName
-                    roles {{
-                      isPartner
-                    }}
-                  }}
-                }}
-              }}
-            }}
-          }}
-        }}
-        """
-        try:
-            r = requests.post("https://gql.twitch.tv/gql", headers=headers, json={"query": dir_query}, timeout=20)
-            edges = (((r.json().get("data") or {}).get("game") or {}).get("clips") or {}).get("edges") or []
-            for edge in edges:
-                node = edge.get("node") or {}
-                slug = node.get("slug")
-                if not slug or slug in processed:
-                    continue
-                dur = float(node.get("durationSeconds") or 30.0)
-                if not (12.0 <= dur <= 60.0):
-                    continue
-                views = int(node.get("viewCount") or 0)
-                broadcaster = node.get("broadcaster") or {}
-                b_login = (broadcaster.get("login") or "").lower().strip()
-                streamer = broadcaster.get("displayName") or "Twitch"
-                is_partner = bool((broadcaster.get("roles") or {}).get("isPartner"))
-
-                if b_login in TWITCH_GIANTS:
-                    vip_candidates.append({
-                        "id": slug,
-                        "game": "Grand Theft Auto VI",
-                        "url": node.get("url") or f"https://clips.twitch.tv/{slug}",
-                        "title": node.get("title") or "GTA 6 Insane Moment",
-                        "streamer": streamer,
-                        "views": views,
-                        "duration": dur,
-                        "tier": "VIP GIANT"
-                    })
-                elif is_partner and views >= NON_VIP_MIN_VIEWS:
-                    verified_viral_candidates.append({
-                        "id": slug,
-                        "game": "Grand Theft Auto VI",
-                        "url": node.get("url") or f"https://clips.twitch.tv/{slug}",
-                        "title": node.get("title") or "GTA 6 Viral Moment",
-                        "streamer": streamer,
-                        "views": views,
-                        "duration": dur,
-                        "tier": "VERIFIED 100K+"
-                    })
-        except Exception:
-            continue
-
-    vip_candidates.sort(key=lambda x: x["views"], reverse=True)
-    verified_viral_candidates.sort(key=lambda x: x["views"], reverse=True)
-
-    combined = vip_candidates + verified_viral_candidates
-    selected = []
-    seen_channels = set()
-    seen_slugs = set()
-
-    for clip in combined:
-        if len(selected) >= limit:
-            break
-        ch = clip["streamer"].lower()
-        if clip["id"] not in seen_slugs and ch not in seen_channels:
-            seen_slugs.add(clip["id"])
-            seen_channels.add(ch)
-            selected.append(clip)
-            print(f"[+] Selected [{clip['tier']}]: @{clip['streamer']} - '{clip['title']}' ({clip['views']:,} views)", flush=True)
-
-    return selected
+def strip_emojis_and_non_ascii(text: str) -> str:
+    """Prevents FFmpeg drawtext missing-glyph boxes."""
+    cleaned = text.encode("ascii", "ignore").decode("ascii")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
 
 
-def download_clip(clip: dict, index: int) -> Path | None:
-    out_mp4 = (WORK_DIR / f"raw_gta6_clip_{index}.mp4").resolve()
-    out_mp4.unlink(missing_ok=True)
-    cmd = [
-        "yt-dlp", "--no-warnings", "--socket-timeout", "30",
-        "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "--merge-output-format", "mp4", "-o", str(out_mp4), clip["url"]
-    ]
+def clean_word_boundary_title(raw: str, max_len: int = 68, suffix: str = "") -> str:
+    """Truncates cleanly on word boundaries so titles never cut off mid-word."""
+    text = strip_emojis_and_non_ascii(raw)
+    text = re.sub(r"#\w+", "", text).strip(" |:-")
+    budget = max_len - len(suffix)
+    if len(text) <= budget:
+        return f"{text}{suffix}".strip()
+    cut = text[:budget].rsplit(" ", 1)[0].rstrip(" ,;:-|!?")
+    return f"{cut}{suffix}".strip()
+
+
+def run_cmd(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check)
+
+
+def probe_video(path: Path) -> Tuple[float, bool]:
+    """Returns (duration_seconds, has_audio)."""
+    res = run_cmd([
+        "ffprobe", "-v", "error", "-print_format", "json",
+        "-show_format", "-show_streams", str(path)
+    ])
+    info = json.loads(res.stdout)
+    duration = float(info.get("format", {}).get("duration", 0.0))
+    has_audio = any(s.get("codec_type") == "audio" for s in info.get("streams", []))
+    return duration, has_audio
+
+
+def has_heavy_profanity(text: str, opening_only_words: Optional[int] = None) -> bool:
+    sample = text
+    if opening_only_words is not None:
+        sample = " ".join(text.split()[:opening_only_words])
+    hits = sum(len(re.findall(pat, sample, flags=re.IGNORECASE)) for pat in HARD_PROFANITY_PATTERNS)
+    if opening_only_words is not None:
+        return hits >= 1
+    return hits >= 3
+
+
+# ==============================================================================
+# TWITCH CLIP FETCHING (HELIX + KEYLESS GQL FALLBACK)
+# ==============================================================================
+def get_helix_token() -> Optional[str]:
+    if not (TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET):
+        return None
     try:
-        proc = subprocess.run(cmd, timeout=180)
-        if proc.returncode == 0 and out_mp4.exists() and out_mp4.stat().st_size > 50000:
-            return out_mp4
+        r = requests.post(
+            "https://id.twitch.tv/oauth2/token",
+            params={
+                "client_id": TWITCH_CLIENT_ID,
+                "client_secret": TWITCH_CLIENT_SECRET,
+                "grant_type": "client_credentials",
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        return r.json().get("access_token")
     except Exception as e:
-        print(f"[!] Download error on {clip['url']}: {e}", flush=True)
+        print(f"[Twitch Helix] Token fetch failed, falling back to GQL: {e}")
+        return None
+
+
+def fetch_clips_helix(limit: int = 40) -> List[Dict]:
+    token = get_helix_token()
+    if not token:
+        return []
+    headers = {"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {token}"}
+    clips: List[Dict] = []
+    try:
+        # Look up GTA 6 game_id
+        g = requests.get(
+            "https://api.twitch.tv/helix/games",
+            headers=headers,
+            params={"name": "Grand Theft Auto VI"},
+            timeout=15,
+        )
+        game_data = g.json().get("data", [])
+        if game_data:
+            game_id = game_data[0]["id"]
+            started_at = datetime.fromtimestamp(time.time() - 72 * 3600, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            c = requests.get(
+                "https://api.twitch.tv/helix/clips",
+                headers=headers,
+                params={"game_id": game_id, "first": limit, "started_at": started_at},
+                timeout=20,
+            )
+            for item in c.json().get("data", []):
+                clips.append({
+                    "id": item["id"],
+                    "slug": item["id"],
+                    "url": item["url"],
+                    "title": item.get("title", ""),
+                    "broadcaster": item.get("broadcaster_name", "Streamer"),
+                    "views": int(item.get("view_count", 0)),
+                    "duration": float(item.get("duration", 0)),
+                    "game": "Grand Theft Auto VI",
+                    "language": item.get("language", "en"),
+                })
+    except Exception as e:
+        print(f"[Twitch Helix] Fetch error: {e}")
+    return clips
+
+
+def fetch_clips_gql_by_game(game_name: str = "Grand Theft Auto VI", period: str = "LAST_DAY", limit: int = 35) -> List[Dict]:
+    query = """
+    query($gameName: String!, $limit: Int!, $filter: ClipsFilter!) {
+      game(name: $gameName) {
+        clips(first: $limit, criteria: { period: $filter }) {
+          edges {
+            node {
+              id
+              slug
+              url
+              title
+              viewCount
+              durationSeconds
+              language
+              broadcaster { displayName login }
+            }
+          }
+        }
+      }
+    }
+    """
+    headers = {"Client-ID": TWITCH_GQL_CLIENT_ID, "Content-Type": "application/json"}
+    payload = {
+        "query": query,
+        "variables": {"gameName": game_name, "limit": limit, "filter": period},
+    }
+    clips: List[Dict] = []
+    try:
+        r = requests.post("https://gql.twitch.tv/gql", headers=headers, json=payload, timeout=20)
+        edges = r.json().get("data", {}).get("game", {}).get("clips", {}).get("edges", [])
+        for edge in edges:
+            node = edge.get("node", {})
+            bc = node.get("broadcaster") or {}
+            clips.append({
+                "id": node.get("slug") or node.get("id"),
+                "slug": node.get("slug"),
+                "url": node.get("url") or f"https://clips.twitch.tv/{node.get('slug')}",
+                "title": node.get("title", ""),
+                "broadcaster": bc.get("displayName", "Streamer"),
+                "views": int(node.get("viewCount", 0)),
+                "duration": float(node.get("durationSeconds", 0)),
+                "game": game_name,
+                "language": (node.get("language") or "en").lower(),
+            })
+    except Exception as e:
+        print(f"[Twitch GQL Game] Error: {e}")
+    return clips
+
+
+def fetch_clips_gql_streamers(streamers: List[str], period: str = "LAST_WEEK") -> List[Dict]:
+    """Backup search on whitelisted streamers filtering for GTA 6 titles."""
+    query = """
+    query($login: String!, $period: ClipsPeriod!) {
+      user(login: $login) {
+        displayName
+        clips(first: 10, criteria: { period: $period }) {
+          edges {
+            node {
+              slug
+              url
+              title
+              viewCount
+              durationSeconds
+              language
+              game { name }
+            }
+          }
+        }
+      }
+    }
+    """
+    headers = {"Client-ID": TWITCH_GQL_CLIENT_ID, "Content-Type": "application/json"}
+    results: List[Dict] = []
+    for login in streamers[:15]:
+        try:
+            r = requests.post(
+                "https://gql.twitch.tv/gql",
+                headers=headers,
+                json={"query": query, "variables": {"login": login, "period": period}},
+                timeout=12,
+            )
+            user = (r.json().get("data") or {}).get("user")
+            if not user:
+                continue
+            bc_name = user.get("displayName", login)
+            for edge in (user.get("clips") or {}).get("edges", []):
+                node = edge.get("node", {})
+                title_lower = (node.get("title") or "").lower()
+                game_name = ((node.get("game") or {}).get("name") or "")
+                is_gta_game = "grand theft auto vi" in game_name.lower() or "gta 6" in game_name.lower()
+                is_gta_title = any(k in title_lower for k in GTA6_KEYWORDS)
+                if is_gta_game or is_gta_title:
+                    results.append({
+                        "id": node.get("slug"),
+                        "slug": node.get("slug"),
+                        "url": node.get("url") or f"https://clips.twitch.tv/{node.get('slug')}",
+                        "title": node.get("title", ""),
+                        "broadcaster": bc_name,
+                        "views": int(node.get("viewCount", 0)),
+                        "duration": float(node.get("durationSeconds", 0)),
+                        "game": game_name or "Grand Theft Auto VI",
+                        "language": (node.get("language") or "en").lower(),
+                    })
+        except Exception:
+            continue
+    return results
+
+
+def get_candidate_clips(processed: set) -> List[Dict]:
+    raw = fetch_clips_helix(40)
+    if len(raw) < 10:
+        raw.extend(fetch_clips_gql_by_game("Grand Theft Auto VI", "LAST_DAY", 35))
+    if len(raw) < 10:
+        raw.extend(fetch_clips_gql_by_game("Grand Theft Auto VI", "LAST_WEEK", 35))
+    if len(raw) < 10:
+        raw.extend(fetch_clips_gql_streamers(WHITELIST_STREAMERS, "LAST_WEEK"))
+
+    seen = set()
+    candidates = []
+    for c in raw:
+        cid = c.get("id")
+        if not cid or cid in processed or cid in seen:
+            continue
+        seen.add(cid)
+        dur = c.get("duration", 0)
+        lang = (c.get("language") or "en").lower()
+        if not (MIN_CLIP_DURATION <= dur <= MAX_CLIP_DURATION):
+            continue
+        # Stick strictly to English clips to keep audience profile consistent
+        if lang and not lang.startswith("en"):
+            continue
+        candidates.append(c)
+
+    # Prefer whitelisted streamers + high views
+    def rank_key(clip: Dict) -> Tuple[int, int]:
+        wl = 1 if clip["broadcaster"].lower() in WHITELIST_STREAMERS else 0
+        return (wl, clip["views"])
+
+    candidates.sort(key=rank_key, reverse=True)
+    return candidates[:15]
+
+
+# ==============================================================================
+# DOWNLOAD & LOCAL FREE TRANSCRIPTION (FASTER-WHISPER)
+# ==============================================================================
+def download_clip(url: str, out_path: Path) -> bool:
+    try:
+        run_cmd([
+            "yt-dlp",
+            "--no-playlist",
+            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "--merge-output-format", "mp4",
+            "-o", str(out_path),
+            url,
+        ])
+        return out_path.exists() and out_path.stat().st_size > 100_000
+    except Exception as e:
+        print(f"[Download] Failed for {url}: {e}")
+        return False
+
+
+def transcribe_clip(whisper_model: WhisperModel, video_path: Path) -> Tuple[str, List[Dict], str]:
+    """Returns (full_text, word_segments, detected_language)."""
+    segments, info = whisper_model.transcribe(
+        str(video_path),
+        beam_size=1,
+        word_timestamps=True,
+        vad_filter=True,
+    )
+    words = []
+    texts = []
+    for seg in segments:
+        texts.append(seg.text.strip())
+        if seg.words:
+            for w in seg.words:
+                cleaned = strip_emojis_and_non_ascii(w.word).strip()
+                if cleaned:
+                    words.append({"word": cleaned, "start": float(w.start), "end": float(w.end)})
+    return " ".join(texts).strip(), words, (info.language or "en")
+
+
+# ==============================================================================
+# GEMINI AI QUALITY GATE & SEO GENERATOR (FREE TIER SAFE)
+# ==============================================================================
+def call_gemini_json(prompt: str) -> Optional[Dict]:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is missing.")
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    last_err = None
+    for model_name in dict.fromkeys(GEMINI_MODELS):
+        if not model_name:
+            continue
+        try:
+            resp = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.4,
+                ),
+            )
+            return json.loads(resp.text)
+        except Exception as e:
+            last_err = e
+            print(f"[Gemini] Model {model_name} failed: {e}")
+            time.sleep(2)
+    print(f"[Gemini] All models failed: {last_err}")
     return None
 
 
-def format_ass_time(seconds: float) -> str:
-    hrs = int(seconds // 3600)
-    mins = int((seconds % 3600) // 60)
-    secs = seconds % 60
-    return f"{hrs}:{mins:02d}:{secs:05.2f}"
+def evaluate_and_package_short(clip: Dict, transcript: str) -> Optional[Dict]:
+    prompt = f"""
+You are a top-performing YouTube Shorts gaming strategist for the channel "The Rippers Gaming" focusing strictly on GTA 6 (Grand Theft Auto VI).
+
+Analyze this Twitch clip candidate:
+- Broadcaster: {clip['broadcaster']}
+- Twitch Category: {clip['game']}
+- Twitch Clip Title: {clip['title']}
+- Views: {clip['views']}
+- Duration: {clip['duration']}s
+- Transcript: "{transcript[:1800]}"
+
+STRICT QUALITY RULES:
+1. Reject if the streamer is talking about unrelated games (like Ark, WoW, Valorant), food/dieting, or random off-topic chatter instead of GTA 6 gameplay, Vice City, characters (Lucia/Jason), or genuine GTA 6 reactions.
+2. Reject if there is heavy profanity or swearing in the first 30 seconds (hurts YouTube distribution).
+3. Never use generic spam titles like "UNREAL PRO CLUTCH!" or "INSANE MOMENT!". Write a specific, curiosity-driven title based on what actually happens in the clip.
+4. Keep yt_title STRICTLY under 60 characters, ASCII only, NO emojis, NO hashtags in the title.
+5. Keep banner_text STRICTLY 2 to 5 punchy words, ALL CAPS, ASCII only, NO emojis (used for FFmpeg overlay).
+6. Write hook_vo: a natural, hype 1-sentence narrator intro (8 to 13 words max, spoken in ~3 seconds) that sets up the moment so the Short is transformative and stops scrolling immediately. Example: "Watch how quickly Kai reacts when Vice City police ambush him."
+7. Write yt_description: 2 short organic sentences describing the moment + proper credit to {clip['broadcaster']} + a specific question related to THIS clip (not "Rate 1-10") + 4 relevant hashtags (#GTA6 #GrandTheftAuto6 #GTAVI #Shorts).
+8. Provide 12 SEO tags (list of strings).
+
+Return ONLY valid JSON with these exact keys:
+{{
+  "is_gta6_relevant": true,
+  "relevance_score": 0,
+  "entertainment_score": 0,
+  "has_opening_profanity": false,
+  "profanity_level": "none",
+  "reject_reason": "",
+  "yt_title": "",
+  "banner_text": "",
+  "hook_vo": "",
+  "yt_description": "",
+  "yt_tags": []
+}}
+"""
+    return call_gemini_json(prompt)
 
 
-def translate_and_polish_gta6_clip(raw_chunks: list[dict], clip_meta: dict) -> tuple[list[dict], str, str, str]:
-    streamer = clip_meta["streamer"]
-    raw_title = clip_meta["title"]
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-
-    fallback_eng_title = re.sub(r"[^A-Za-z0-9 !?\-&]", "", raw_title).strip() or "FIRST GTA 6 GAMEPLAY!"
-    fallback_yt = f"@{streamer} Reacts to GTA 6: {fallback_eng_title[:40]} 🤯 #GTA6 #Shorts"
-    fallback_cap = (
-        f"🚨 @{streamer} in GTA 6: {fallback_eng_title} 🤯🔥\n"
-        f"What is the first thing you're doing in Vice City?! Drop a comment below! 👇\n"
-        f"Follow @TheRippersGaming for non-stop GTA 6 clips & highlights!\n\n"
-        f"#GTA6 #GTAVI #GrandTheftAuto6 #ViceCity #{re.sub(r'[^A-Za-z0-9]', '', streamer)} #Shorts #TheRippersGaming"
-    )
-
-    if not api_key:
-        return raw_chunks, fallback_eng_title.upper()[:32], fallback_yt, fallback_cap
+# ==============================================================================
+# VOICEOVER (EDGE-TTS) & SUBTITLE (.ASS) GENERATION
+# ==============================================================================
+def generate_edge_tts(text: str, out_mp3: Path) -> float:
+    """Generates free neural voiceover and returns its duration in seconds."""
+    async def _run():
+        comm = edge_tts.Communicate(text, voice=TTS_VOICE, rate=TTS_RATE)
+        await comm.save(str(out_mp3))
 
     try:
-        client = genai.Client(api_key=api_key)
-        lines_payload = [{"i": idx, "t": c["text"]} for idx, c in enumerate(raw_chunks)]
-        prompt = f"""
-GTA 6 Twitch Clip Title: '{raw_title}' | Famous Streamer: {streamer} | Game: Grand Theft Auto VI.
-Subtitle phrases: {json.dumps(lines_payload, ensure_ascii=False)}
-
-IMPORTANT: Translate and write EVERYTHING in 100% natural, viral ENGLISH (even if the streamer is Ibai, Auronplay, Gaules, Kamet0, etc. speaking Spanish, Portuguese, or French).
-
-Return ONLY raw valid JSON with keys:
-- "english_banner_title": Ultra-hype 2-to-5 word ALL CAPS English hook for the top banner (e.g. "KAI CENAT IN VICE CITY!", "XQC BREAKS GTA 6!", max 30 chars).
-- "yt_title": High-CTR English YouTube Short title under 90 chars mentioning @{streamer}, GTA 6, and #Shorts.
-- "social_caption": Viral Instagram/Facebook/YouTube caption in English with emojis, a question baiting GTA 6 fans to comment, a call-to-action to follow @TheRippersGaming, and 6 trending GTA 6 hashtags (#GTA6 #GTAVI #ViceCity etc.).
-- "subs": Array of objects {{"i": index, "t": "ENGLISH ALL CAPS PHRASE (2-4 words)"}} matching the input subtitle phrases.
-"""
-        resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-        parsed = json.loads(re.sub(r"^```json|```$", "", resp.text.strip(), flags=re.MULTILINE).strip())
-
-        mapping = {int(item["i"]): str(item["t"]).upper().strip() for item in parsed.get("subs", []) if "i" in item and "t" in item}
-        for idx, c in enumerate(raw_chunks):
-            if idx in mapping and mapping[idx]:
-                c["text"] = mapping[idx]
-
-        eng_banner = str(parsed.get("english_banner_title") or fallback_eng_title).upper()[:32]
-        yt_t = str(parsed.get("yt_title") or fallback_yt)
-        soc_c = str(parsed.get("social_caption") or fallback_cap)
-        return raw_chunks, eng_banner, yt_t, soc_c
+        asyncio.run(_run())
+        dur, _ = probe_video(out_mp3)
+        return dur
     except Exception as e:
-        print(f"[!] Gemini GTA 6 translation/caption fallback used: {e}", flush=True)
-        return raw_chunks, fallback_eng_title.upper()[:32], fallback_yt, fallback_cap
+        print(f"[edge-tts] Failed ({e}), proceeding without VO.")
+        return 0.0
 
 
-def build_hormozi_ass_events(raw_chunks: list[dict], clip_dur: float) -> list[str]:
-    events = []
-    for chunk in raw_chunks:
-        s_t = max(0.0, float(chunk["start"]))
-        e_t = min(clip_dur, float(chunk["end"]))
-        if e_t <= s_t:
-            continue
-        clean_phrase = re.sub(r"[{}\\]", "", chunk["text"]).strip().upper()
-        words = [w for w in clean_phrase.split() if w]
-        if not words:
-            continue
-
-        total_dur = max(0.15, e_t - s_t)
-        word_step = total_dur / len(words)
-
-        for w_idx in range(len(words)):
-            w_start = s_t + (w_idx * word_step)
-            w_end = s_t + ((w_idx + 1) * word_step) if w_idx < len(words) - 1 else e_t
-            formatted_words = []
-            for j, word_str in enumerate(words):
-                if j == w_idx:
-                    formatted_words.append(r"{\c&H0000FFFF&\fscx118\fscy118}" + word_str + r"{\c&H00FFFFFF&\fscx100\fscy100}")
-                else:
-                    formatted_words.append(word_str)
-            events.append(f"Dialogue: 2,{format_ass_time(w_start)},{format_ass_time(w_end)},WordSub,,0,0,0,,{' '.join(formatted_words)}")
-    return events
+def fmt_ass_time(sec: float) -> str:
+    sec = max(0.0, sec)
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = sec % 60
+    return f"{h}:{m:02d}:{s:05.2f}"
 
 
-def render_gta6_vertical_short(raw_mp4: Path, clip_meta: dict, out_mp4: Path, whisper_model: WhisperModel) -> tuple[str, str]:
-    probe_cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(raw_mp4.resolve())]
-    clip_dur = min(58.0, float(subprocess.check_output(probe_cmd, timeout=20).decode().strip()))
-
-    wav_clip = (WORK_DIR / "clip_audio.wav").resolve()
-    ass_file = (WORK_DIR / "subtitles.ass").resolve()
-
-    subprocess.run([
-        "ffmpeg", "-y", "-i", str(raw_mp4.resolve()), "-t", str(clip_dur),
-        "-vn", "-ac", "1", "-ar", "16000", str(wav_clip)
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60, check=True)
-
-    segments_gen, info = whisper_model.transcribe(str(wav_clip), task="translate", word_timestamps=True, beam_size=5)
-    detected_lang = getattr(info, "language", "en")
-    print(f"    [*] Streamer language detected: '{detected_lang}' -> Translating to 100% English", flush=True)
-
-    raw_chunks = []
-    for seg in segments_gen:
-        if seg.words:
-            chunk = []
-            for w in seg.words:
-                chunk.append(w)
-                if len(chunk) == 3:
-                    raw_chunks.append({
-                        "start": max(0.0, chunk[0].start),
-                        "end": min(clip_dur, chunk[-1].end),
-                        "text": " ".join(x.word.strip() for x in chunk)
-                    })
-                    chunk = []
-            if chunk:
-                raw_chunks.append({
-                    "start": max(0.0, chunk[0].start),
-                    "end": min(clip_dur, chunk[-1].end),
-                    "text": " ".join(x.word.strip() for x in chunk)
-                })
-        elif seg.text.strip():
-            words = seg.text.strip().split()
-            seg_dur = max(0.5, seg.end - seg.start)
-            num_groups = max(1, (len(words) + 2) // 3)
-            step = seg_dur / num_groups
-            for g_idx in range(num_groups):
-                grp = words[g_idx * 3:(g_idx + 1) * 3]
-                raw_chunks.append({
-                    "start": max(0.0, seg.start + g_idx * step),
-                    "end": min(clip_dur, seg.start + (g_idx + 1) * step),
-                    "text": " ".join(grp)
-                })
-
-    raw_chunks, eng_banner, yt_title, social_caption = translate_and_polish_gta6_clip(raw_chunks, clip_meta)
-
-    ass_header = """[Script Info]
+def build_ass_subtitles(words: List[Dict], ass_path: Path, vo_dur: float) -> None:
+    """Creates bold, mobile-safe 3-word-chunk kinetic subtitles positioned above Shorts UI."""
+    header = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
+WrapStyle: 2
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: TopBanner,DejaVu Sans,50,&H00FFFFFF,&H000000FF,&H00000000,&HB49314FF,-1,0,0,0,100,100,0,0,3,16,0,8,40,40,170,1
-Style: WordSub,DejaVu Sans,70,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,7,4,2,60,60,330,1
-Style: Watermark,DejaVu Sans,30,&H80FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,2,0,1,3,1,2,40,40,185,1
-Style: SubscribeCTA,DejaVu Sans,46,&H00FFFFFF,&H0000FFFF,&H00000000,&HD89314FF,-1,0,0,0,100,100,0,0,3,18,0,2,40,40,115,1
+Style: Default,DejaVu Sans,68,&H00FFFFFF,&H0000D7FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,6,2,2,80,80,410,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
-    clean_streamer = re.sub(r"[^A-Za-z0-9_]", "", clip_meta["streamer"])[:20] or "TWITCH"
-    clean_banner = re.sub(r"[^A-Za-z0-9 !?\-&]", "", eng_banner).strip()[:32]
-    cta_start = max(3.0, clip_dur - 3.5)
-
-    events = [
-        f"Dialogue: 0,0:00:00.00,{format_ass_time(clip_dur)},TopBanner,,0,0,0,,@{clean_streamer.upper()} • GTA VI\\N{clean_banner}",
-        f"Dialogue: 0,0:00:00.00,{format_ass_time(cta_start)},Watermark,,0,0,0,,@THERIPPERSGAMING",
-        f"Dialogue: 3,{format_ass_time(cta_start)},{format_ass_time(clip_dur)},SubscribeCTA,,0,0,0,,SUBSCRIBE & FOLLOW @THERIPPERSGAMING\\NFOR DAILY GTA 6 CLIPS!"
-    ]
-    events.extend(build_hormozi_ass_events(raw_chunks, clip_dur))
-    ass_file.write_text(ass_header + "\n".join(events) + "\n", encoding="utf-8")
-
-    # Top-Right Logo Overlay (if logo.png exists in repo root)
-    if LOGO_PATH.exists():
-        vf_complex = (
-            "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5[bg];"
-            "[0:v]scale=1080:-2:force_original_aspect_ratio=decrease[fg];"
-            "[bg][fg]overlay=(W-w)/2:(H-h)/2,ass=subtitles.ass[subbed];"
-            "[1:v]scale=145:-1,format=rgba,colorchannelmixer=aa=0.85[logo];"
-            "[subbed][logo]overlay=W-w-35:40,format=yuv420p[vout]"
-        )
-        ff_cmd = [
-            "ffmpeg", "-y", "-t", str(clip_dur),
-            "-i", str(raw_mp4.resolve()),
-            "-i", str(LOGO_PATH),
-            "-filter_complex", vf_complex,
-            "-map", "[vout]", "-map", "0:a?",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-r", "30",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2",
-            str(out_mp4.resolve())
-        ]
-    else:
-        vf_complex = (
-            "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:5[bg];"
-            "[0:v]scale=1080:-2:force_original_aspect_ratio=decrease[fg];"
-            "[bg][fg]overlay=(W-w)/2:(H-h)/2,ass=subtitles.ass,format=yuv420p[vout]"
-        )
-        ff_cmd = [
-            "ffmpeg", "-y", "-t", str(clip_dur),
-            "-i", str(raw_mp4.resolve()),
-            "-filter_complex", vf_complex,
-            "-map", "[vout]", "-map", "0:a?",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-r", "30",
-            "-pix_fmt", "yuv420p", "-movflags", "+faststart", "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2",
-            str(out_mp4.resolve())
-        ]
-
-    subprocess.run(ff_cmd, cwd=str(WORK_DIR.resolve()), timeout=240, check=True)
-    print(f"[+] Rendered GTA 6 Vertical Short: {out_mp4.name}", flush=True)
-    return yt_title, social_caption
-
-
-def ensure_gta6_playlist(youtube) -> str | None:
-    if not youtube:
-        return None
-    cache = {}
-    if PLAYLIST_CACHE_FILE.exists():
-        try:
-            cache = json.loads(PLAYLIST_CACHE_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            cache = {}
-
-    if "gta6" in cache and cache["gta6"]:
-        return cache["gta6"]
-
-    title = "GTA 6 (Grand Theft Auto VI) Best Streamer Clips & Highlights"
-    try:
-        res = youtube.playlists().insert(
-            part="snippet,status",
-            body={
-                "snippet": {
-                    "title": title,
-                    "description": "The biggest GTA 6 (Grand Theft Auto VI) streamer reactions, Vice City gameplay moments, and viral Twitch clips by The Rippers Gaming."
-                },
-                "status": {"privacyStatus": "public"}
-            }
-        ).execute()
-        pl_id = res["id"]
-        cache["gta6"] = pl_id
-        PLAYLIST_CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
-        return pl_id
-    except Exception:
-        return None
-
-
-def upload_youtube_short(video_path: Path, title: str, description: str):
-    cid = os.environ.get("YT_CLIENT_ID", "").strip()
-    csec = os.environ.get("YT_CLIENT_SECRET", "").strip()
-    rtok = os.environ.get("YT_REFRESH_TOKEN", "").strip()
-    if not (cid and csec and rtok):
-        return
-    try:
-        creds = Credentials(token=None, refresh_token=rtok, token_uri="https://oauth2.googleapis.com/token", client_id=cid, client_secret=csec)
-        youtube = build("youtube", "v3", credentials=creds)
-        body = {
-            "snippet": {"title": title[:99], "description": description, "categoryId": "20"},
-            "status": {"privacyStatus": "public", "selfDeclaredMadeForKids": False}
-        }
-        media = MediaFileUpload(str(video_path.resolve()), chunksize=10 * 1024 * 1024, resumable=True)
-        req = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
-        res = None
-        while res is None:
-            _, res = req.next_chunk()
-        vid_id = res["id"]
-        print(f"[+] GTA 6 YouTube Short Uploaded: https://youtube.com/shorts/{vid_id}", flush=True)
-
-        pl_id = ensure_gta6_playlist(youtube)
-        if pl_id:
-            try:
-                youtube.playlistItems().insert(
-                    part="snippet",
-                    body={"snippet": {"playlistId": pl_id, "resourceId": {"kind": "youtube#video", "videoId": vid_id}}}
-                ).execute()
-            except Exception:
-                pass
-    except Exception as e:
-        if "uploadLimitExceeded" in str(e):
-            print("[!] YouTube Daily Upload Limit Reached! Continuing to Facebook & Instagram Reels...", flush=True)
-        else:
-            print(f"[-] YouTube Error: {e}", flush=True)
-
-
-def upload_to_facebook_reels(video_path: Path, caption: str):
-    page_id = os.environ.get("FB_PAGE_ID", "").strip()
-    token = os.environ.get("FB_PAGE_ACCESS_TOKEN", "").strip()
-    if not (page_id and token):
-        return
-    try:
-        init_res = requests.post(f"https://graph.facebook.com/v21.0/{page_id}/video_reels", data={"upload_phase": "start", "access_token": token}, timeout=30).json()
-        video_id = init_res["video_id"]
-        with open(video_path.resolve(), "rb") as f:
-            requests.post(init_res["upload_url"], headers={"Authorization": f"OAuth {token}", "offset": "0", "file_size": str(video_path.stat().st_size)}, data=f, timeout=180)
-        requests.post(f"https://graph.facebook.com/v21.0/{page_id}/video_reels", data={"access_token": token, "video_id": video_id, "upload_phase": "finish", "video_state": "PUBLISHED", "description": caption}, timeout=60)
-        print("[+] GTA 6 Facebook Reel Published!", flush=True)
-    except Exception as e:
-        print(f"[-] FB Error: {e}", flush=True)
-
-
-def upload_to_instagram_reels(video_path: Path, caption: str, idx: int):
-    ig_user_id = os.environ.get("IG_USER_ID", "").strip()
-    token = os.environ.get("FB_PAGE_ACCESS_TOKEN", "").strip()
-    repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
-    branch = os.environ.get("GITHUB_REF_NAME", "main").strip()
-    if not (ig_user_id and token and repo):
-        return
-    try:
-        stage_filename = f"gta6_reel_{int(time.time())}_{idx}.mp4"
-        staged_path = IG_STAGE_DIR / stage_filename
-        shutil.copy2(video_path.resolve(), staged_path)
-        subprocess.run(["git", "add", "-f", str(staged_path)], timeout=30, check=True)
-        subprocess.run(["git", "commit", "-m", f"temp: stage gta6 reel {idx} [skip ci]"], timeout=30, check=True)
-        subprocess.run(["git", "pull", "--rebase", "-X", "ours", "origin", branch], timeout=60, check=False)
-        subprocess.run(["git", "push", "origin", f"HEAD:{branch}"], timeout=60, check=True)
-
-        raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/ig_stage/{stage_filename}"
-        time.sleep(5)
-
-        c_res = requests.post(f"https://graph.facebook.com/v21.0/{ig_user_id}/media", data={"media_type": "REELS", "video_url": raw_url, "caption": caption, "share_to_feed": "true", "access_token": token}, timeout=30).json()
-        creation_id = c_res["id"]
-        for _ in range(20):
-            time.sleep(10)
-            s_res = requests.get(f"https://graph.facebook.com/v21.0/{creation_id}", params={"fields": "status_code", "access_token": token}, timeout=30).json()
-            if s_res.get("status_code") == "FINISHED":
-                break
-        requests.post(f"https://graph.facebook.com/v21.0/{ig_user_id}/media_publish", data={"creation_id": creation_id, "access_token": token}, timeout=30)
-        print("[+] GTA 6 Instagram Reel Published!", flush=True)
-    except Exception as e:
-        print(f"[-] IG Error: {e}", flush=True)
-
-
-def main():
-    clips_per_run = int(os.environ.get("CLIPS_COUNT", "2"))
-    processed = load_processed_clips()
-    print(f"[*] Searching for top {clips_per_run} GTA 6 clips from Famous Twitch Giants...", flush=True)
-    clips = fetch_gta6_giant_clips(processed, limit=clips_per_run)
-
-    if not clips:
-        print("[!] No new unposted GTA 6 clips from VIP Giants or Verified 100k+ streamers right now.", flush=True)
-        return
-
-    print("[*] Loading faster-whisper ('small' multilingual-to-English model)...", flush=True)
-    whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
-
-    for i, clip_meta in enumerate(clips):
-        print(f"\n--- Processing GTA 6 Clip {i+1}/{len(clips)}: '{clip_meta['title']}' by @{clip_meta['streamer']} ---", flush=True)
-        raw_mp4 = download_clip(clip_meta, i)
-        if not raw_mp4:
+    lines = [header]
+    # Group words into punchy 3-word bursts; skip overlapping during VO intro
+    chunk_size = 3
+    i = 0
+    while i < len(words):
+        chunk = words[i:i + chunk_size]
+        i += chunk_size
+        start = chunk[0]["start"]
+        end = max(chunk[-1]["end"], start + 0.35)
+        if end <= vo_dur:
             continue
+        start = max(start, vo_dur + 0.05)
+        text = " ".join(w["word"].upper() for w in chunk)
+        # Fix common GTA 6 ASR typos
+        text = re.sub(r"\bGTA\s*SIX\b", "GTA 6", text)
+        text = re.sub(r"\bLOUISA\b|\bLUCIA'S\b", "LUCIA", text)
+        text = text.replace("{", "").replace("}", "")
+        lines.append(f"Dialogue: 0,{fmt_ass_time(start)},{fmt_ass_time(end)},Default,,0,0,0,,{text}")
 
-        final_short = (WORK_DIR / f"gta6_short_{i}.mp4").resolve()
-        yt_title, caption = render_gta6_vertical_short(raw_mp4, clip_meta, final_short, whisper_model)
+    ass_path.write_text("\n".join(lines), encoding="utf-8")
 
-        upload_youtube_short(final_short, yt_title, caption)
-        upload_to_facebook_reels(final_short, caption)
-        upload_to_instagram_reels(final_short, caption, i)
 
-        mark_clip_processed(clip_meta["id"])
-        time.sleep(15)
+# ==============================================================================
+# FFMPEG 9:16 SHORTS RENDERER (PUNCH-IN FRAMING + VO DUCKING + CLEAN BANNER)
+# ==============================================================================
+def render_short(
+    raw_video: Path,
+    out_video: Path,
+    banner_text: str,
+    broadcaster: str,
+    words: List[Dict],
+    hook_vo: str,
+    workdir: Path,
+) -> bool:
+    duration, has_audio = probe_video(raw_video)
+    if duration < MIN_CLIP_DURATION:
+        return False
 
-    shutil.rmtree(WORK_DIR, ignore_errors=True)
-    shutil.rmtree(IG_STAGE_DIR, ignore_errors=True)
-    print("[+] GTA 6 TWITCH GIANTS SHORTS BATCH PUBLISHED SUCCESSFULLY!", flush=True)
+    vo_path = workdir / "hook_vo.mp3"
+    vo_dur = generate_edge_tts(strip_emojis_and_non_ascii(hook_vo), vo_path) if hook_vo else 0.0
+
+    banner_file = workdir / "banner.txt"
+    banner_file.write_text(strip_emojis_and_non_ascii(banner_text).upper()[:38], encoding="utf-8")
+
+    credit_file = workdir / "credit.txt"
+    credit_file.write_text(f"CREDIT: {strip_emojis_and_non_ascii(broadcaster).upper()}", encoding="utf-8")
+
+    ass_path = workdir / "subs.ass"
+    build_ass_subtitles(words, ass_path, vo_dur)
+
+    # Escape path for libass filter
+    ass_escaped = str(ass_path).replace("\\", "/").replace(":", "\\:")
+    banner_escaped = str(banner_file).replace("\\", "/").replace(":", "\\:")
+    credit_escaped = str(credit_file).replace("\\", "/").replace(":", "\\:")
+
+    inputs = ["-i", str(raw_video)]
+    vo_idx = None
+    logo_idx = None
+    next_idx = 1
+
+    if vo_dur > 0.2 and vo_path.exists():
+        inputs.extend(["-i", str(vo_path)])
+        vo_idx = next_idx
+        next_idx += 1
+
+    if LOGO_PATH.exists():
+        inputs.extend(["-i", str(LOGO_PATH)])
+        logo_idx = next_idx
+        next_idx += 1
+
+    # Visual pipeline:
+    # 1. Blurred 9:16 ambient background
+    # 2. 1.35x punched-in foreground gameplay (1080x1020) so FPS/GTA details are readable on mobile
+    # 3. Sleek dark banner bar at top + crisp ASCII text via textfile (zero glyph bugs)
+    # 4. Kinetic .ass subtitles in mobile safe zone
+    v_filters = [
+        "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=22:8,eq=brightness=-0.15[bg]",
+        "[0:v]scale=-2:1020,crop=min(iw\\,1080):1020:(iw-min(iw\\,1080))/2:0[fg]",
+        "[bg][fg]overlay=(W-w)/2:420[base]",
+        "[base]drawbox=x=50:y=220:w=980:h=130:color=0x0B0B0D@0.88:t=fill,"
+        "drawbox=x=50:y=346:w=980:h=6:color=0x007BFF@1.0:t=fill,"
+        f"drawtext=fontfile='{FONT_PATH}':textfile='{banner_escaped}':"
+        "fontcolor=white:fontsize=50:x=(w-text_w)/2:y=260,"
+        f"drawtext=fontfile='{FONT_PATH}':textfile='{credit_escaped}':"
+        "fontcolor=0xCCCCCC:fontsize=28:x=60:y=1458:box=1:boxcolor=0x000000@0.65:boxborderw=8,"
+        f"ass='{ass_escaped}'[vpre]",
+    ]
+
+    if logo_idx is not None:
+        v_filters.append(f"[{logo_idx}:v]scale=120:-1[lg]")
+        v_filters.append("[vpre][lg]overlay=W-w-45:70[vout]")
+    else:
+        v_filters.append("[vpre]copy[vout]")
+
+    # Audio pipeline: duck original clip audio during VO hook, then restore to 100%, loudness normalize
+    a_filters = []
+    if has_audio and vo_idx is not None:
+        duck_end = vo_dur + 0.15
+        a_filters.append(
+            f"[0:a]volume='if(lt(t,{duck_end:.2f}),0.22,1.0)':eval=frame[aduck]"
+        )
+        a_filters.append(
+            f"[{vo_idx}:a]volume=1.18[avo]"
+        )
+        a_filters.append(
+            "[aduck][avo]amix=inputs=2:duration=first:dropout_transition=1:normalize=0,"
+            "loudnorm=I=-14:TP=-1.5:LRA=11[aout]"
+        )
+    elif has_audio:
+        a_filters.append("[0:a]loudnorm=I=-14:TP=-1.5:LRA=11[aout]")
+    elif vo_idx is not None:
+        a_filters.append(f"[{vo_idx}:a]loudnorm=I=-14:TP=-1.5:LRA=11[aout]")
+
+    filter_complex = ";".join(v_filters + a_filters)
+    cmd = [
+        "ffmpeg", "-y", *inputs,
+        "-filter_complex", filter_complex,
+        "-map", "[vout]",
+    ]
+    if a_filters:
+        cmd.extend(["-map", "[aout]"])
+    cmd.extend([
+        "-t", str(min(duration, 58.0)),
+        "-c:v", "libx264", "-preset", "medium", "-crf", "21",
+        "-pix_fmt", "yuv420p", "-r", "30",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-movflags", "+faststart",
+        str(out_video),
+    ])
+
+    res = run_cmd(cmd, check=False)
+    if res.returncode != 0:
+        print(f"[FFmpeg Error]\n{res.stderr[-1500:]}")
+        return False
+    return out_video.exists() and out_video.stat().st_size > 100_000
+
+
+# ==============================================================================
+# MULTI-PLATFORM PUBLISHING (YOUTUBE + FACEBOOK REELS + INSTAGRAM REELS)
+# ==============================================================================
+def upload_to_youtube(video_path: Path, title: str, description: str, tags: List[str]) -> Optional[str]:
+    if not (YT_CLIENT_ID and YT_CLIENT_SECRET and YT_REFRESH_TOKEN):
+        print("[YouTube] Missing credentials, skipping.")
+        return None
+    creds = Credentials(
+        token=None,
+        refresh_token=YT_REFRESH_TOKEN,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=YT_CLIENT_ID,
+        client_secret=YT_CLIENT_SECRET,
+        scopes=["https://www.googleapis.com/auth/youtube.upload"],
+    )
+    creds.refresh(Request())
+    yt = build("youtube", "v3", credentials=creds)
+
+    body = {
+        "snippet": {
+            "title": title,
+            "description": description,
+            "tags": tags[:15],
+            "categoryId": "20",  # Gaming
+            "defaultLanguage": "en",
+            "defaultAudioLanguage": "en",
+        },
+        "status": {
+            "privacyStatus": "public",
+            "selfDeclaredMadeForKids": False,
+        },
+    }
+    media = MediaFileUpload(str(video_path), chunksize=-1, resumable=True, mimetype="video/mp4")
+    req = yt.videos().insert(part="snippet,status", body=body, media_body=media)
+    resp = req.execute()
+    vid_id = resp.get("id")
+    print(f"[YouTube] Published Short: https://youtube.com/shorts/{vid_id}")
+    return vid_id
+
+
+def upload_to_facebook_reel(video_path: Path, caption: str) -> None:
+    if not (FB_PAGE_ID and FB_PAGE_ACCESS_TOKEN):
+        print("[Facebook] Missing credentials, skipping.")
+        return
+    try:
+        # Step 1: Initialize upload session
+        init_r = requests.post(
+            f"https://graph.facebook.com/v21.0/{FB_PAGE_ID}/video_reels",
+            params={"upload_phase": "start", "access_token": FB_PAGE_ACCESS_TOKEN},
+            timeout=30,
+        ).json()
+        video_id = init_r.get("video_id")
+        upload_url = init_r.get("upload_url")
+        if not (video_id and upload_url):
+            print(f"[Facebook] Init failed: {init_r}")
+            return
+
+        # Step 2: Upload binary file
+        file_size = video_path.stat().st_size
+        with video_path.open("rb") as f:
+            up_r = requests.post(
+                upload_url,
+                headers={
+                    "Authorization": f"OAuth {FB_PAGE_ACCESS_TOKEN}",
+                    "offset": "0",
+                    "file_size": str(file_size),
+                },
+                data=f,
+                timeout=120,
+            )
+            up_r.raise_for_status()
+
+        # Step 3: Publish Reel
+        fin_r = requests.post(
+            f"https://graph.facebook.com/v21.0/{FB_PAGE_ID}/video_reels",
+            params={
+                "upload_phase": "finish",
+                "video_id": video_id,
+                "video_state": "PUBLISHED",
+                "description": caption,
+                "access_token": FB_PAGE_ACCESS_TOKEN,
+            },
+            timeout=30,
+        ).json()
+        print(f"[Facebook] Reel response: {fin_r}")
+    except Exception as e:
+        print(f"[Facebook] Upload error: {e}")
+
+
+def git_stage_push_and_get_raw_url(video_path: Path, filename: str) -> Optional[str]:
+    if not GITHUB_REPOSITORY:
+        print("[Instagram] GITHUB_REPOSITORY not set, skipping IG staging.")
+        return None
+    IG_STAGE_DIR.mkdir(exist_ok=True)
+    staged_file = IG_STAGE_DIR / filename
+    shutil.copy2(video_path, staged_file)
+    try:
+        run_cmd(["git", "add", str(staged_file)])
+        run_cmd(["git", "commit", "-m", f"stage ig reel {filename}"])
+        run_cmd(["git", "push", "origin", GITHUB_REF_NAME])
+    except Exception as e:
+        print(f"[Instagram] Git staging push failed: {e}")
+        return None
+
+    raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPOSITORY}/{GITHUB_REF_NAME}/ig_stage/{filename}"
+    # Wait for GitHub CDN to serve HTTP 200 before calling Meta API
+    for _ in range(12):
+        try:
+            head = requests.head(raw_url, timeout=10)
+            if head.status_code == 200:
+                return raw_url
+        except Exception:
+            pass
+        time.sleep(5)
+    print(f"[Instagram] Timed out waiting for raw URL: {raw_url}")
+    return None
+
+
+def cleanup_ig_stage(filename: str) -> None:
+    staged_file = IG_STAGE_DIR / filename
+    if staged_file.exists():
+        staged_file.unlink()
+        try:
+            run_cmd(["git", "add", "-u", str(IG_STAGE_DIR)])
+            run_cmd(["git", "commit", "-m", f"cleanup ig reel {filename}"])
+            run_cmd(["git", "push", "origin", GITHUB_REF_NAME])
+        except Exception as e:
+            print(f"[Instagram] Cleanup commit note: {e}")
+
+
+def upload_to_instagram_reel(video_path: Path, caption: str, clip_id: str) -> None:
+    if not (IG_USER_ID and FB_PAGE_ACCESS_TOKEN):
+        print("[Instagram] Missing credentials, skipping.")
+        return
+    filename = f"short_{clip_id}.mp4"
+    raw_url = git_stage_push_and_get_raw_url(video_path, filename)
+    if not raw_url:
+        return
+    try:
+        create_r = requests.post(
+            f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media",
+            params={
+                "media_type": "REELS",
+                "video_url": raw_url,
+                "caption": caption,
+                "share_to_feed": "true",
+                "access_token": FB_PAGE_ACCESS_TOKEN,
+            },
+            timeout=30,
+        ).json()
+        creation_id = create_r.get("id")
+        if not creation_id:
+            print(f"[Instagram] Container creation failed: {create_r}")
+            return
+
+        # Poll container until FINISHED
+        for _ in range(24):
+            time.sleep(10)
+            status_r = requests.get(
+                f"https://graph.facebook.com/v21.0/{creation_id}",
+                params={"fields": "status_code", "access_token": FB_PAGE_ACCESS_TOKEN},
+                timeout=15,
+            ).json()
+            code = status_r.get("status_code")
+            print(f"[Instagram] Container status: {code}")
+            if code == "FINISHED":
+                pub_r = requests.post(
+                    f"https://graph.facebook.com/v21.0/{IG_USER_ID}/media_publish",
+                    params={"creation_id": creation_id, "access_token": FB_PAGE_ACCESS_TOKEN},
+                    timeout=30,
+                ).json()
+                print(f"[Instagram] Published Reel: {pub_r}")
+                break
+            if code == "ERROR":
+                print(f"[Instagram] Container error: {status_r}")
+                break
+    except Exception as e:
+        print(f"[Instagram] Upload error: {e}")
+    finally:
+        cleanup_ig_stage(filename)
+
+
+# ==============================================================================
+# MAIN PIPELINE
+# ==============================================================================
+def main() -> None:
+    processed = load_processed_ids(STATE_FILE)
+    candidates = get_candidate_clips(processed)
+    print(f"[Pipeline] Found {len(candidates)} fresh English GTA 6 candidates.")
+
+    if not candidates:
+        print("[Pipeline] No eligible clips found. Exiting cleanly.")
+        return
+
+    whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        workdir = Path(tmp)
+        for clip in candidates:
+            cid = clip["id"]
+            print(f"\n[Inspecting] {clip['broadcaster']} | {clip['title']} ({clip['views']} views)")
+            raw_mp4 = workdir / f"raw_{cid}.mp4"
+            if not download_clip(clip["url"], raw_mp4):
+                continue
+
+            transcript, words, lang = transcribe_clip(whisper_model, raw_mp4)
+            if lang != "en" or len(transcript.split()) < 6:
+                print(f"[Skip] Non-English ({lang}) or too little speech.")
+                save_processed_id(STATE_FILE, cid)
+                continue
+
+            if has_heavy_profanity(transcript, opening_only_words=45):
+                print("[Skip] Hard profanity detected in first 30 seconds.")
+                save_processed_id(STATE_FILE, cid)
+                continue
+
+            ai = evaluate_and_package_short(clip, transcript)
+            if not ai:
+                continue
+
+            rel = int(ai.get("relevance_score", 0))
+            ent = int(ai.get("entertainment_score", 0))
+            is_rel = bool(ai.get("is_gta6_relevant", False))
+            open_prof = bool(ai.get("has_opening_profanity", False))
+            prof_lvl = str(ai.get("profanity_level", "none")).lower()
+
+            print(f"[AI Score] relevant={is_rel} ({rel}/10), fun={ent}/10, profanity={prof_lvl}")
+            if not is_rel or rel < MIN_RELEVANCE_SCORE or ent < MIN_ENTERTAINMENT_SCORE or open_prof or prof_lvl == "heavy":
+                print(f"[Rejected] {ai.get('reject_reason', 'Below quality threshold')}")
+                save_processed_id(STATE_FILE, cid)
+                continue
+
+            # Qualified! Render 9:16 Short
+            final_mp4 = workdir / f"final_{cid}.mp4"
+            yt_title = clean_word_boundary_title(ai.get("yt_title", clip["title"]), max_len=68, suffix=" #Shorts")
+            banner_text = strip_emojis_and_non_ascii(ai.get("banner_text", "GTA 6 MOMENT"))
+            hook_vo = strip_emojis_and_non_ascii(ai.get("hook_vo", ""))
+            yt_desc = ai.get("yt_description", f"GTA 6 clip featuring {clip['broadcaster']}. #GTA6 #Shorts")
+            yt_tags = ai.get("yt_tags", ["GTA 6", "Grand Theft Auto VI", "GTA VI", clip["broadcaster"], "Shorts"])
+
+            ok = render_short(raw_mp4, final_mp4, banner_text, clip["broadcaster"], words, hook_vo, workdir)
+            if not ok:
+                continue
+
+            # Publish across YouTube, Facebook, and Instagram
+            upload_to_youtube(final_mp4, yt_title, yt_desc, yt_tags)
+            social_caption = f"{yt_title}\n\n{yt_desc}"
+            upload_to_facebook_reel(final_mp4, social_caption)
+            upload_to_instagram_reel(final_mp4, social_caption, cid)
+
+            save_processed_id(STATE_FILE, cid)
+            print("[Done] Successfully published 1 high-quality GTA 6 Short.")
+            return
+
+    print("[Pipeline] No candidate passed the strict quality gate this run.")
 
 
 if __name__ == "__main__":
