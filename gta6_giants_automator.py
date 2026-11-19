@@ -641,14 +641,14 @@ def upload_to_youtube(video_path: Path, title: str, description: str, tags: List
     if not (YT_CLIENT_ID and YT_CLIENT_SECRET and YT_REFRESH_TOKEN):
         print("[YouTube] Missing credentials, skipping.")
         return None
-    creds = Credentials(
+        creds = Credentials(
         token=None,
         refresh_token=YT_REFRESH_TOKEN,
         token_uri="https://oauth2.googleapis.com/token",
         client_id=YT_CLIENT_ID,
         client_secret=YT_CLIENT_SECRET,
-        scopes=["https://www.googleapis.com/auth/youtube.upload"],
     )
+
     creds.refresh(Request())
     yt = build("youtube", "v3", credentials=creds)
 
