@@ -21,7 +21,6 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-# Ensure chronological logs in GitHub Actions
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 
@@ -31,8 +30,7 @@ if hasattr(sys.stdout, "reconfigure"):
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_MODELS = [
     os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite").strip(),
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
+    "gemini-3.8-flash",
 ]
 
 TWITCH_CLIENT_ID = os.environ.get("TWITCH_CLIENT_ID", "").strip()
@@ -54,6 +52,15 @@ STATE_FILE = Path("processed_gta6_clips.txt")
 LOGO_PATH = Path("logo.png")
 IG_STAGE_DIR = Path("ig_stage")
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+# Auto-link-proof endpoint constants
+GOOGLE_TOKEN_URI = "https://" "oauth2.googleapis.com/token"
+TWITCH_TOKEN_URI = "https://" "id.twitch.tv/oauth2/token"
+TWITCH_HELIX_BASE = "https://" "api.twitch.tv/helix"
+TWITCH_GQL_URI = "https://" "gql.twitch.tv/gql"
+TWITCH_CLIP_BASE = "https://" "clips.twitch.tv/"
+GRAPH_FB_BASE = "https://" "graph.facebook.com/v21.0"
+GH_RAW_BASE = "https://" "raw.githubusercontent.com"
 
 MIN_CLIP_DURATION = 12
 MAX_CLIP_DURATION = 58
@@ -100,14 +107,12 @@ def save_processed_id(path: Path, clip_id: str) -> None:
 
 
 def strip_emojis_and_non_ascii(text: str) -> str:
-    """Prevents FFmpeg drawtext missing-glyph boxes and YouTube invalid characters."""
     cleaned = (text or "").encode("ascii", "ignore").decode("ascii")
     cleaned = cleaned.replace("<", "").replace(">", "")
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def clean_word_boundary_title(raw: str, max_len: int = 68, suffix: str = "") -> str:
-    """Truncates cleanly on word boundaries so titles never cut off mid-word."""
     text = strip_emojis_and_non_ascii(raw)
     text = re.sub(r"#\w+", "", text).strip(" |:-")
     if not text:
@@ -127,7 +132,6 @@ def sanitize_yt_description(desc: str, fallback: str) -> str:
 
 
 def sanitize_yt_tags(tags: List[str], fallback: List[str]) -> List[str]:
-    """Enforces YouTube Data API tag rules (< 500 total chars, no angle brackets)."""
     source = tags if isinstance(tags, list) and tags else fallback
     result: List[str] = []
     seen = set()
@@ -156,7 +160,6 @@ def run_cmd(cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
 
 
 def probe_video(path: Path) -> Tuple[float, bool]:
-    """Returns (duration_seconds, has_audio)."""
     res = run_cmd([
         "ffprobe", "-v", "error", "-print_format", "json",
         "-show_format", "-show_streams", str(path),
@@ -181,7 +184,7 @@ def get_helix_token() -> Optional[str]:
         return None
     try:
         r = requests.post(
-            "https://id.twitch.tv/oauth2/token",
+            TWITCH_TOKEN_URI,
             params={
                 "client_id": TWITCH_CLIENT_ID,
                 "client_secret": TWITCH_CLIENT_SECRET,
@@ -204,7 +207,7 @@ def fetch_clips_helix(limit: int = 40) -> List[Dict]:
     clips: List[Dict] = []
     try:
         g = requests.get(
-            "https://api.twitch.tv/helix/games",
+            f"{TWITCH_HELIX_BASE}/games",
             headers=headers,
             params={"name": "Grand Theft Auto VI"},
             timeout=15,
@@ -214,7 +217,7 @@ def fetch_clips_helix(limit: int = 40) -> List[Dict]:
             game_id = game_data[0]["id"]
             started_at = datetime.fromtimestamp(time.time() - 72 * 3600, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             c = requests.get(
-                "https://api.twitch.tv/helix/clips",
+                f"{TWITCH_HELIX_BASE}/clips",
                 headers=headers,
                 params={"game_id": game_id, "first": limit, "started_at": started_at},
                 timeout=20,
@@ -261,7 +264,7 @@ def fetch_clips_gql_by_game(game_name: str = "Grand Theft Auto VI", period: str 
     payload = {"query": query, "variables": {"gameName": game_name, "limit": limit, "filter": period}}
     clips: List[Dict] = []
     try:
-        r = requests.post("https://gql.twitch.tv/gql", headers=headers, json=payload, timeout=20)
+        r = requests.post(TWITCH_GQL_URI, headers=headers, json=payload, timeout=20)
         edges = (((r.json() or {}).get("data") or {}).get("game") or {}).get("clips", {}).get("edges") or []
         for edge in edges:
             node = (edge or {}).get("node") or {}
@@ -272,7 +275,7 @@ def fetch_clips_gql_by_game(game_name: str = "Grand Theft Auto VI", period: str 
             clips.append({
                 "id": slug,
                 "slug": slug,
-                "url": node.get("url") or f"https://clips.twitch.tv/{slug}",
+                "url": node.get("url") or f"{TWITCH_CLIP_BASE}{slug}",
                 "title": node.get("title", ""),
                 "broadcaster": bc.get("displayName") or bc.get("login") or "Streamer",
                 "views": int(node.get("viewCount", 0) or 0),
@@ -311,7 +314,7 @@ def fetch_clips_gql_streamers(streamers: List[str], period: str = "LAST_WEEK") -
     for login in streamers[:15]:
         try:
             r = requests.post(
-                "https://gql.twitch.tv/gql",
+                TWITCH_GQL_URI,
                 headers=headers,
                 json={"query": query, "variables": {"login": login, "period": period}},
                 timeout=12,
@@ -333,7 +336,7 @@ def fetch_clips_gql_streamers(streamers: List[str], period: str = "LAST_WEEK") -
                     results.append({
                         "id": slug,
                         "slug": slug,
-                        "url": node.get("url") or f"https://clips.twitch.tv/{slug}",
+                        "url": node.get("url") or f"{TWITCH_CLIP_BASE}{slug}",
                         "title": node.get("title", ""),
                         "broadcaster": bc_name,
                         "views": int(node.get("viewCount", 0) or 0),
@@ -420,7 +423,7 @@ def transcribe_clip(whisper_model: WhisperModel, video_path: Path) -> Tuple[str,
 
 
 # ==============================================================================
-# GEMINI AI QUALITY GATE & SEO GENERATOR
+# GEMINI AI QUALITY GATE & SEO GENERATOR (WITH 503 BACKOFF + 3.8 FALLBACK)
 # ==============================================================================
 def parse_json_safely(raw_text: str) -> Dict:
     text = (raw_text or "").strip()
@@ -435,23 +438,30 @@ def call_gemini_json(prompt: str) -> Optional[Dict]:
         raise RuntimeError("GEMINI_API_KEY is missing.")
     client = genai.Client(api_key=GEMINI_API_KEY)
     last_err = None
+
     for model_name in dict.fromkeys(GEMINI_MODELS):
         if not model_name:
             continue
-        try:
-            resp = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.4,
-                ),
-            )
-            return parse_json_safely(resp.text)
-        except Exception as e:
-            last_err = e
-            print(f"[Gemini] Model {model_name} failed: {e}")
-            time.sleep(2)
+        for attempt in range(1, 4):
+            try:
+                resp = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.4,
+                    ),
+                )
+                return parse_json_safely(resp.text)
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                print(f"[Gemini] {model_name} (try {attempt}/3) failed: {e}")
+                if any(code in err_str for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")):
+                    time.sleep(4 * attempt)
+                    continue
+                break
+
     print(f"[Gemini] All models failed: {last_err}")
     return None
 
@@ -459,6 +469,8 @@ def call_gemini_json(prompt: str) -> Optional[Dict]:
 def evaluate_and_package_short(clip: Dict, transcript: str) -> Optional[Dict]:
     prompt = f"""
 You are a top-performing YouTube Shorts gaming strategist for "The Rippers Gaming" focusing strictly on GTA 6 (Grand Theft Auto VI).
+
+CRITICAL FACT: Today is November 2026. Grand Theft Auto VI (GTA 6) IS OFFICIALLY RELEASED and streamers are actively playing real GTA 6 gameplay live on Twitch right now. NEVER reject a clip by claiming GTA 6 is unreleased.
 
 Analyze this Twitch clip candidate:
 - Broadcaster: {clip['broadcaster']}
@@ -469,14 +481,15 @@ Analyze this Twitch clip candidate:
 - Transcript: "{transcript[:1800]}"
 
 STRICT QUALITY RULES:
-1. Reject if the streamer is talking about unrelated games (like Ark, WoW, Valorant), food/dieting, or random off-topic chatter instead of GTA 6 gameplay, Vice City, characters (Lucia/Jason), or genuine GTA 6 reactions.
-2. Reject if there is heavy profanity or swearing in the first 30 seconds.
-3. Never use generic spam titles like "UNREAL PRO CLUTCH!" or "INSANE MOMENT!". Write a specific, curiosity-driven title based on what happens in the clip.
-4. Keep yt_title STRICTLY under 60 characters, ASCII only, NO emojis, NO hashtags.
-5. Keep banner_text STRICTLY 2 to 5 punchy words, ALL CAPS, ASCII only, NO emojis.
-6. Write hook_vo: a natural, hype 1-sentence narrator intro (8 to 13 words max, spoken in ~3 seconds) setting up the moment so the Short is transformative and stops scrolling immediately.
-7. Write yt_description: 2 short organic sentences describing the moment + credit to {clip['broadcaster']} + 1 specific question about THIS clip (not "Rate 1-10") + 4 hashtags (#GTA6 #GrandTheftAuto6 #GTAVI #Shorts).
-8. Provide 12 targeted SEO tags (list of strings).
+1. Approve genuine GTA 6 gameplay, Vice City/Leonida moments, Jason/Lucia story reactions, funny in-game glitches, or direct GTA 6 streamer commentary.
+2. Reject off-topic chatter (unrelated games like Ark/WoW/Valorant, food/dieting, politics/drama) or overly sexual/NSFW clips that could get age-restricted.
+3. Reject if there is heavy profanity or swearing in the first 30 seconds.
+4. Never use generic spam titles like "UNREAL PRO CLUTCH!" or "INSANE MOMENT!". Write a specific, curiosity-driven title based on what happens in the clip.
+5. Keep yt_title STRICTLY under 60 characters, ASCII only, NO emojis, NO hashtags.
+6. Keep banner_text STRICTLY 2 to 5 punchy words, ALL CAPS, ASCII only, NO emojis.
+7. Write hook_vo: a natural, hype 1-sentence narrator intro (8 to 13 words max, spoken in ~3 seconds) setting up the moment so the Short is transformative and stops scrolling immediately.
+8. Write yt_description: 2 short organic sentences describing the moment + credit to {clip['broadcaster']} + 1 specific question about THIS clip (not "Rate 1-10") + 4 hashtags (#GTA6 #GrandTheftAuto6 #GTAVI #Shorts).
+9. Provide 12 targeted SEO tags (list of strings).
 
 Return ONLY valid JSON with these exact keys:
 {{
@@ -500,7 +513,6 @@ Return ONLY valid JSON with these exact keys:
 # VOICEOVER (EDGE-TTS WITH MULTI-VOICE FALLBACK) & SUBTITLES (.ASS)
 # ==============================================================================
 def generate_edge_tts(text: str, out_mp3: Path) -> float:
-    """Generates free neural voiceover with multi-voice fallback and returns duration in seconds."""
     clean_text = re.sub(r"[^A-Za-z0-9 ,.!?'-]", "", text or "").strip()
     if not clean_text:
         return 0.0
@@ -544,7 +556,6 @@ def fmt_ass_time(sec: float) -> str:
 
 
 def build_ass_subtitles(words: List[Dict], ass_path: Path, vo_dur: float) -> int:
-    """Creates bold, mobile-safe 3-word kinetic subtitles. Returns number of dialogue lines written."""
     header = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -703,7 +714,7 @@ def upload_to_youtube(video_path: Path, title: str, description: str, tags: List
     creds = Credentials(
         token=None,
         refresh_token=YT_REFRESH_TOKEN,
-        token_uri="[https://oauth2.googleapis.com/token](https://oauth2.googleapis.com/token)",
+        token_uri=GOOGLE_TOKEN_URI,
         client_id=YT_CLIENT_ID,
         client_secret=YT_CLIENT_SECRET,
     )
@@ -727,7 +738,7 @@ def upload_to_youtube(video_path: Path, title: str, description: str, tags: List
     media = MediaFileUpload(str(video_path), chunksize=8 * 1024 * 1024, resumable=True, mimetype="video/mp4")
     resp = yt.videos().insert(part="snippet,status", body=body, media_body=media).execute()
     vid_id = resp.get("id")
-    print(f"[YouTube] Published Short: [https://youtube.com/shorts/](https://youtube.com/shorts/){vid_id}")
+    print(f"[YouTube] Published Short ID: {vid_id}")
     return vid_id
 
 
@@ -737,7 +748,7 @@ def upload_to_facebook_reel(video_path: Path, caption: str) -> None:
         return
     try:
         init_r = requests.post(
-            f"[https://graph.facebook.com/v21.0/](https://graph.facebook.com/v21.0/){FB_PAGE_ID}/video_reels",
+            f"{GRAPH_FB_BASE}/{FB_PAGE_ID}/video_reels",
             params={"upload_phase": "start", "access_token": FB_PAGE_ACCESS_TOKEN},
             timeout=30,
         ).json()
@@ -762,7 +773,7 @@ def upload_to_facebook_reel(video_path: Path, caption: str) -> None:
             up_r.raise_for_status()
 
         fin_r = requests.post(
-            f"[https://graph.facebook.com/v21.0/](https://graph.facebook.com/v21.0/){FB_PAGE_ID}/video_reels",
+            f"{GRAPH_FB_BASE}/{FB_PAGE_ID}/video_reels",
             params={
                 "upload_phase": "finish",
                 "video_id": video_id,
@@ -795,7 +806,7 @@ def git_stage_push_and_get_raw_url(video_path: Path, filename: str) -> Optional[
             staged_file.unlink()
         return None
 
-    raw_url = f"[https://raw.githubusercontent.com/](https://raw.githubusercontent.com/){GITHUB_REPOSITORY}/{GITHUB_REF_NAME}/ig_stage/{filename}"
+    raw_url = f"{GH_RAW_BASE}/{GITHUB_REPOSITORY}/{GITHUB_REF_NAME}/ig_stage/{filename}"
     for _ in range(12):
         try:
             head = requests.head(raw_url, timeout=10)
@@ -833,7 +844,7 @@ def upload_to_instagram_reel(video_path: Path, caption: str, clip_id: str) -> No
         return
     try:
         create_r = requests.post(
-            f"[https://graph.facebook.com/v21.0/](https://graph.facebook.com/v21.0/){IG_USER_ID}/media",
+            f"{GRAPH_FB_BASE}/{IG_USER_ID}/media",
             params={
                 "media_type": "REELS",
                 "video_url": raw_url,
@@ -851,7 +862,7 @@ def upload_to_instagram_reel(video_path: Path, caption: str, clip_id: str) -> No
         for _ in range(24):
             time.sleep(10)
             status_r = requests.get(
-                f"[https://graph.facebook.com/v21.0/](https://graph.facebook.com/v21.0/){creation_id}",
+                f"{GRAPH_FB_BASE}/{creation_id}",
                 params={"fields": "status_code", "access_token": FB_PAGE_ACCESS_TOKEN},
                 timeout=15,
             ).json()
@@ -859,7 +870,7 @@ def upload_to_instagram_reel(video_path: Path, caption: str, clip_id: str) -> No
             print(f"[Instagram] Container status: {code}")
             if code == "FINISHED":
                 pub_r = requests.post(
-                    f"[https://graph.facebook.com/v21.0/](https://graph.facebook.com/v21.0/){IG_USER_ID}/media_publish",
+                    f"{GRAPH_FB_BASE}/{IG_USER_ID}/media_publish",
                     params={"creation_id": creation_id, "access_token": FB_PAGE_ACCESS_TOKEN},
                     timeout=30,
                 ).json()
