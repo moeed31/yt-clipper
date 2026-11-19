@@ -1,104 +1,109 @@
-name: GTA 6 Twitch Giants Viral Clipper & Daily Compilation
+name: GTA 6 AI-Optimized Automator
 
 on:
   schedule:
-    - cron: '30 */4 * * *' # 9:16 Vertical Shorts/Reels every 4 hours
-    - cron: '0 15 * * *'   # 16:9 Widescreen Daily Compilation once a day at 15:00 UTC (8:00 PM PKT)
+    # Shorts: 2x daily at peak engagement windows (replaces 4-hour spam cadence)
+    - cron: "0 12 * * *"
+    - cron: "0 20 * * *"
+    # Daily 16:9 Compilation: 1x daily at 15:00 UTC
+    - cron: "0 15 * * *"
   workflow_dispatch:
     inputs:
-      run_mode:
-        description: 'Select Mode to Run Manually'
-        required: false
-        default: 'shorts_9x16'
+      mode:
+        description: "Select pipeline to run manually"
+        required: true
+        default: "shorts"
         type: choice
         options:
-          - shorts_9x16
-          - compilation_16x9
-          - both
-      clips_count:
-        description: 'Number of 9:16 Shorts to publish (when running shorts)'
-        required: false
-        default: '2'
-        type: string
-
-concurrency:
-  group: repo-git-sync
-  cancel-in-progress: false
+          - shorts
+          - compilation
 
 permissions:
   contents: write
 
+concurrency:
+  group: gta6-automator
+  cancel-in-progress: false
+
 jobs:
-  publish_gta6_content:
+  run_pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 35
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: Install FFmpeg & Fonts
+      - name: Install FFmpeg & DejaVu fonts
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg fonts-liberation fonts-dejavu-core
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
 
-      - name: Configure Git for Instagram Staging & State Tracking
+      - name: Install Python dependencies
         run: |
-          git config --local user.email "actions@github.com"
-          git config --local user.name "Esports Automator Bot"
+          python -m pip install --upgrade pip
+          pip install --quiet \
+            google-genai \
+            google-api-python-client \
+            google-auth \
+            google-auth-oauthlib \
+            faster-whisper \
+            edge-tts \
+            yt-dlp \
+            requests \
+            Pillow
 
-      - name: Install Python Packages
+      - name: Configure Git for state & Instagram staging commits
         run: |
-          pip install --upgrade pip
-          pip install "yt-dlp[default,curl-cffi]" faster-whisper requests pillow google-genai
-          pip install google-api-python-client google-auth-oauthlib google-auth-httplib2
+          git config user.name "TRG Automator"
+          git config user.email "actions@github.com"
 
-      - name: Run 9:16 GTA 6 Shorts Clipper (Every 4 Hours or Manual)
-        if: github.event.schedule == '30 */4 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.run_mode == 'shorts_9x16' || inputs.run_mode == 'both'))
+      - name: Run GTA 6 Shorts Automator
+        if: >
+          (github.event_name == 'schedule' && (github.event.schedule == '0 12 * * *' || github.event.schedule == '0 20 * * *')) ||
+          (github.event_name == 'workflow_dispatch' && inputs.mode == 'shorts')
         env:
-          PYTHONUNBUFFERED: '1'
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_REF_NAME: ${{ github.ref_name }}
-          CLIPS_COUNT: ${{ inputs.clips_count || '2' }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
+          TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
-          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
-        run: |
-          python3 gta6_giants_automator.py
-
-      - name: Run 16:9 GTA 6 Daily Compilation (Once Daily or Manual)
-        if: github.event.schedule == '0 15 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.run_mode == 'compilation_16x9' || inputs.run_mode == 'both'))
-        env:
-          PYTHONUNBUFFERED: '1'
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: python gta6_giants_automator.py
+
+      - name: Run GTA 6 Daily Compilation Automator
+        if: >
+          (github.event_name == 'schedule' && github.event.schedule == '0 15 * * *') ||
+          (github.event_name == 'workflow_dispatch' && inputs.mode == 'compilation')
+        env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
+          TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
           FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
-        run: |
-          python3 gta6_daily_compilation.py
+        run: python gta6_daily_compilation.py
 
-      - name: Clean Up Temporary IG Files & Commit Processed GTA 6 Records
-        if: always()
+      - name: Commit and push updated state files
         run: |
-          rm -rf ig_stage/
-          git add -A ig_stage/ processed_gta6_clips.txt processed_gta6_comp_clips.txt playlists.json 2>/dev/null || true
+          git pull --rebase origin "${{ github.ref_name }}" || true
+          git add processed_gta6_clips.txt processed_gta6_comp_clips.txt 2>/dev/null || true
           if ! git diff --staged --quiet; then
-            git commit -m "chore: update processed GTA 6 records [skip ci]"
-            for i in 1 2 3; do
-              git pull --rebase -X ours origin ${{ github.ref_name }} && git push origin HEAD:${{ github.ref_name }} && break
-              sleep 5
-            done
+            git commit -m "chore: update GTA 6 processed clip state"
+            git push origin "${{ github.ref_name }}"
           fi
