@@ -1,0 +1,86 @@
+name: Twitch Live & VOD Safe Stream Clipper
+
+on:
+  schedule:
+    # 2x daily at peak gaming hours (UTC) for steady algorithm growth
+    - cron: "0 13 * * *"
+    - cron: "0 21 * * *"
+  workflow_dispatch:
+    inputs:
+      privacy:
+        description: "YouTube upload privacy (use unlisted for initial safety checks)"
+        required: true
+        default: "unlisted"
+        type: choice
+        options:
+          - unlisted
+          - public
+
+permissions:
+  contents: write
+
+concurrency:
+  group: twitch-stream-clipper
+  cancel-in-progress: false
+
+jobs:
+  clip_and_publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install FFmpeg & DejaVu fonts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --quiet --upgrade \
+            google-genai \
+            google-api-python-client \
+            google-auth \
+            google-auth-oauthlib \
+            faster-whisper \
+            edge-tts \
+            yt-dlp \
+            requests
+
+      - name: Configure Git for state & Instagram staging commits
+        run: |
+          git config user.name "TRG Automator"
+          git config user.email "actions@github.com"
+
+      - name: Run Live/VOD Safe Stream Clipper
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          YT_PRIVACY_STATUS: ${{ inputs.privacy || 'public' }}
+          FB_PAGE_ID: ${{ secrets.FB_PAGE_ID }}
+          FB_PAGE_ACCESS_TOKEN: ${{ secrets.FB_PAGE_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: python twitch_stream_clipper.py
+
+      - name: Commit and push updated stream state
+        run: |
+          git pull --rebase origin "${{ github.ref_name }}" || true
+          git add processed_stream_segments.txt 2>/dev/null || true
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: update processed Twitch stream segments"
+            git push origin "${{ github.ref_name }}"
+          fi
